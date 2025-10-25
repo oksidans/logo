@@ -151,7 +151,7 @@ func MapToCSV(src map[string]string) []string {
 		case "referring_page":
 			out[i] = absReferring
 		case "protocol":
-			out[i] = ""
+			out[i] = get("ClientRequestScheme")
 		case "day":
 			out[i] = day
 		case "month":
