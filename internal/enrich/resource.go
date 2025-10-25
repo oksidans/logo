@@ -13,24 +13,19 @@ func ResourceTypeFromURL(u string) string {
 	}
 	lc := strings.ToLower(u)
 
-	// Parse URL, fall back to raw path if no scheme/host
 	parsed, err := url.Parse(lc)
 	var p string
 	if err == nil && parsed != nil {
-		// prefer path; ignore query & fragment
 		p = parsed.Path
 	} else {
 		p = lc
 	}
-
 	p = strings.TrimSpace(p)
 	if p == "" {
 		return ""
 	}
 
-	ext := strings.TrimPrefix(strings.ToLower(path.Ext(p)), ".") // "" if none
-
-	// Known extension table
+	ext := strings.TrimPrefix(strings.ToLower(path.Ext(p)), ".")
 	switch ext {
 	case "jpg", "jpeg", "png", "gif", "webp", "avif", "svg", "ico", "bmp", "tif", "tiff":
 		return "Image"
@@ -45,7 +40,6 @@ func ResourceTypeFromURL(u string) string {
 	case "php", "asp", "aspx", "jsp", "cfm":
 		return "ServerScript"
 	case "xml":
-		// refine to Sitemap/Feed by path hints
 		if strings.Contains(p, "sitemap") {
 			return "Sitemap"
 		}
@@ -69,15 +63,11 @@ func ResourceTypeFromURL(u string) string {
 		return "Manifest"
 	}
 
-	// Heuristics without extension
 	if strings.Contains(p, "/wp-json") || strings.Contains(p, "/graphql") || strings.Contains(p, "/api/") {
 		return "API"
 	}
-	// If ends with slash or no dot at all → likely an HTML page/route
 	if strings.HasSuffix(p, "/") || !strings.Contains(p, ".") {
 		return "Page"
 	}
-
-	// Fallback if dot exists but unknown ext
 	return "Page"
 }

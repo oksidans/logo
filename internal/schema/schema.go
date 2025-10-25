@@ -1,4 +1,3 @@
-// This file will target columns (keeping order)
 package schema
 
 type Kind int
@@ -15,7 +14,7 @@ type Column struct {
 	Kind Kind
 }
 
-// Defining the column names based upon the col names from logana final CSV
+// BaseColumns: Stage 1 output schema (normalize)
 var BaseColumns = []Column{
 	{Name: "host_ip", Kind: String},
 	{Name: "time_zone", Kind: String},
@@ -42,10 +41,4 @@ func BaseHeader() []string {
 		out[i] = c.Name
 	}
 	return out
-}
-
-// Stage 2: Base + resource_type (computed)
-func EnrichedHeader() []string {
-	h := BaseHeader()
-	return append(h, "resource_type")
 }
