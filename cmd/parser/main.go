@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"regexp"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ func main() {
 	botsPath := flag.String("bots", "", "Bot rules file (.json or .yaml)")
 	workers := flag.Int("workers", 15, "Number of parallel DNS lookup workers (verify stage only)")
 	showPlan := flag.Bool("plan", false, "Show plan and exit (for debugging)")
+	uaPtrVerify := flag.Bool("ua-ptr-verify", false, "If true, mark verified=1 when UA and PTR share the same base domain (heuristic)")
 
 	flag.Parse()
 
@@ -36,6 +38,7 @@ func main() {
 		fmt.Printf("Output : %s\n", *outPath)
 		fmt.Printf("Workers: %d\n", *workers)
 		fmt.Printf("Bots   : %s\n", *botsPath)
+		fmt.Printf("UA↔PTR Heuristic: %v\n", *uaPtrVerify)
 		return
 	}
 
@@ -58,7 +61,7 @@ func main() {
 			log.Fatal(err)
 		}
 	case "merge":
-		if err := runMerge(ctx, "final.csv", "verified.csv", *outPath); err != nil {
+		if err := runMerge(ctx, "final.csv", "verified.csv", *outPath, *uaPtrVerify); err != nil {
 			log.Fatal(err)
 		}
 	default:
@@ -68,29 +71,46 @@ func main() {
 
 // ---------- STAGE 1: normalize ----------
 func runNormalize(ctx context.Context, inPath, outPath string) error {
+	if inPath == "" || outPath == "" {
+		return fmt.Errorf("normalize: --in and --out are required")
+	}
+	if inPath == outPath {
+		return fmt.Errorf("normalize: input and output paths must differ (got %q)", inPath)
+	}
+
 	in, err := iox.OpenAuto(inPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("open input: %w", err)
 	}
 	defer in.Close()
 
 	reader := csvin.New(in, csvin.Options{Comma: ',', TrimSpace: true})
-	if _, _, err := reader.Header(); err != nil {
-		return err
+	header, _, err := reader.Header()
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
 	}
+	if len(header) == 0 {
+		return fmt.Errorf("normalize: input has no header")
+	}
+	log.Printf("normalize: input header has %d columns; first 10: %v", len(header), func() []string {
+		if len(header) > 10 {
+			return header[:10]
+		}
+		return header
+	}())
 
 	out, err := iox.CreateAuto(outPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("create output: %w", err)
 	}
 	defer out.Close()
 
 	writer := csvout.New(out)
 	if err := writer.WriteHeader(schema.BaseHeader()); err != nil {
-		return err
+		return fmt.Errorf("write header: %w", err)
 	}
 
-	var rowsIn, rowsOut int
+	var rowsIn, rowsOut, bad int64
 	start := time.Now()
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -100,24 +120,23 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			log.Printf("normalize progress: in=%d out=%d", rowsIn, rowsOut)
+			log.Printf("normalize progress: in=%d out=%d bad=%d", rowsIn, rowsOut, bad)
 		default:
 			row, err := reader.Next()
 			if err != nil {
 				if err == io.EOF {
 					goto DONE
 				}
-				log.Printf("read err: %v", err)
+				bad++
 				continue
 			}
 			rowsIn++
 
-			// KLJUČNO: mapiranje iz izvornog CSV-a (npr. ClientIP, ClientRequestURI, ...)
-			// u naš izlazni BaseHeader redosled.
+			// KLJUČNO: mapiranje (ClientIP, ClientRequestURI, ...) -> schema.BaseHeader()
 			outRow := mapper.MapToCSV(row)
 
 			if err := writer.WriteRow(outRow); err != nil {
-				return err
+				return fmt.Errorf("write row: %w", err)
 			}
 			rowsOut++
 		}
@@ -125,9 +144,12 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 
 DONE:
 	if err := writer.Flush(); err != nil {
-		return err
+		return fmt.Errorf("flush: %w", err)
 	}
-	log.Printf("normalize done. in=%d out=%d time=%s", rowsIn, rowsOut, time.Since(start))
+	log.Printf("normalize done. in=%d out=%d bad=%d time=%s", rowsIn, rowsOut, bad, time.Since(start))
+	if rowsOut == 0 {
+		log.Printf("normalize: WARNING: produced 0 rows — check input columns (e.g. ClientIP)")
+	}
 	return nil
 }
 
@@ -190,7 +212,7 @@ func runEnrich(ctx context.Context, inPath, outPath string) error {
 			}
 			rowsIn++
 
-			// 1) target -> klasifikacija resursa (koristimo 'target', fallback na 'referring_page')
+			// 1) target -> klasifikacija resursa (koristi 'target', fallback na 'referring_page')
 			url := row["target"]
 			if url == "" {
 				url = row["referring_page"]
@@ -240,7 +262,6 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 		return fmt.Errorf("read header: %w", err)
 	}
 
-	// helper: nadji prvu postojeću kolonu iz liste kandidata
 	findCol := func(cands ...string) (string, bool) {
 		for _, h := range header {
 			hn := strings.TrimSpace(h)
@@ -253,7 +274,6 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 		return "", false
 	}
 
-	// primarno očekujemo 'host_ip' iz normalize faze; fallback ako je input neki drugi
 	ipCol, ok := findCol("host_ip", "ClientIP", "client_ip", "ip", "remote_addr")
 	if !ok {
 		return fmt.Errorf("could not find an IP column (tried: host_ip, ClientIP, client_ip, ip, remote_addr)")
@@ -297,7 +317,6 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 	log.Printf("scanned rows=%d, empty_ip=%d, unique_ips=%d", totalRows, emptyIPs, len(ips))
 	if len(ips) == 0 {
 		log.Printf("no IPs found; is %q the correct input file and does column %q contain data?", inPath, ipCol)
-		// napiši prazan verified.csv radi konzistentnosti
 		return verifier.WriteResultsCSV(outPath, nil)
 	}
 
@@ -373,7 +392,66 @@ func uniqJoinPipe(a, b string) string {
 	return strings.Join(out, "|")
 }
 
-func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string) error {
+// UA↔PTR domen poklapanje (heuristika): ako UA sadrži hostname(ove) čiji je base domen isti kao neki iz PTR-ova, vrati true.
+func uaPtrSameBaseDomain(ua, ptrBlob string) bool {
+	if ua == "" || ptrBlob == "" {
+		return false
+	}
+	ptrDomains := make(map[string]struct{})
+	for _, tok := range strings.Split(ptrBlob, "|") {
+		d := baseDomain(hostFromAny(tok))
+		if d != "" {
+			ptrDomains[d] = struct{}{}
+		}
+	}
+	for _, d := range extractDomainsFromUA(ua) {
+		bd := baseDomain(d)
+		if bd == "" {
+			continue
+		}
+		if _, ok := ptrDomains[bd]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Grubo iz UA izvlači kandidate za host/domene (npr. crawl-xxx.mj12bot.com)
+func extractDomainsFromUA(ua string) []string {
+	ua = strings.ToLower(ua)
+	re := regexp.MustCompile(`([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}`)
+	m := re.FindAllString(ua, -1)
+	uniq := make(map[string]struct{}, len(m))
+	out := make([]string, 0, len(m))
+	for _, s := range m {
+		s = strings.Trim(s, ".")
+		if _, ok := uniq[s]; !ok {
+			uniq[s] = struct{}{}
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func hostFromAny(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimSuffix(s, ".")
+	return s
+}
+
+// “Base” domen (poslednje 2 labele). Dovoljno za tipične slučajeve (mj12bot.com, google.com, msn.com)
+func baseDomain(host string) string {
+	if host == "" {
+		return ""
+	}
+	parts := strings.Split(host, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	return parts[len(parts)-2] + "." + parts[len(parts)-1]
+}
+
+func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPtrVerify bool) error {
 	type verPair struct {
 		name string
 		flag string // "1" or "0"
@@ -488,14 +566,25 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string) erro
 
 			ipKey := normalizeIPKey(row["host_ip"])
 			if p, ok := verMap[ipKey]; ok {
+				// botName = union (uniq) postojećeg i iz verified.csv
 				row["botName"] = uniqJoinPipe(row["botName"], p.name)
+				// verified = "1"/"0" iz verified.csv
 				row["verified"] = p.flag
+
+				// Heuristika: ako verified==0, a UA i PTR dele isti base domen -> verified=1 (ako je flag uključen)
+				if uaPtrVerify && row["verified"] != "1" {
+					ua := strings.ToLower(row["user_agent"])
+					ptrBlob := strings.ToLower(row["botName"]) // PTR-ovi + eventualno ime bota
+					if uaPtrSameBaseDomain(ua, ptrBlob) {
+						row["verified"] = "1"
+					}
+				}
 				patched++
 			}
 
 			outRow := make([]string, len(schema.BaseColumns))
 			for i, c := range schema.BaseColumns {
-				outRow[i] = row[c.Name]
+				outRow[i] = row[c.Name] // protocol ostaje kakav je bio
 			}
 			if err := writer.WriteRow(outRow); err != nil {
 				return fmt.Errorf("write row: %w", err)
