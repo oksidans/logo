@@ -107,7 +107,6 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 			}
 			rowsIn++
 
-			// write as-is for now (already normalized CSV)
 			outRow := make([]string, len(schema.BaseColumns))
 			for i, c := range schema.BaseColumns {
 				outRow[i] = row[c.Name]
@@ -289,14 +288,14 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string) erro
 		if ip == "" {
 			continue
 		}
-		flag := "0"
+		vflag := "0"
 		switch strings.TrimSpace(row["verified"]) {
 		case "1", "true", "TRUE", "True", "yes", "y":
-			flag = "1"
+			vflag = "1"
 		default:
-			flag = "0"
+			vflag = "0"
 		}
-		verMap[ip] = verPair{name: strings.TrimSpace(row["botName"]), flag: flag}
+		verMap[ip] = verPair{name: strings.TrimSpace(row["botName"]), flag: vflag}
 	}
 
 	in, err := iox.OpenAuto(finalPath)
