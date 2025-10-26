@@ -12,6 +12,7 @@ import (
 	"parser/internal/botdetector"
 	"parser/internal/csvin"
 	"parser/internal/csvout"
+	"parser/internal/enrich"
 	"parser/internal/iox"
 	"parser/internal/schema"
 	"parser/internal/verifier"
@@ -20,7 +21,7 @@ import (
 func main() {
 	inPath := flag.String("in", "", "Input CSV file path")
 	outPath := flag.String("out", "", "Output CSV file path")
-	stage := flag.String("stage", "normalize", "Stage: normalize | verify | merge")
+	stage := flag.String("stage", "normalize", "Stage: normalize | enrich | verify | merge")
 	botsPath := flag.String("bots", "", "Bot rules file (.json or .yaml)")
 	workers := flag.Int("workers", 15, "Number of parallel DNS lookup workers (verify stage only)")
 	showPlan := flag.Bool("plan", false, "Show plan and exit (for debugging)")
@@ -44,8 +45,12 @@ func main() {
 		if err := runNormalize(ctx, *inPath, *outPath); err != nil {
 			log.Fatal(err)
 		}
+	case "enrich":
+		if err := runEnrich(ctx, *inPath, *outPath); err != nil {
+			log.Fatal(err)
+		}
 	case "verify":
-		if err := botdetector.InitFromFile(*botsPath); err != nil {
+		if err := botdetector.InitFromFile(*botsPath); err != nil && *botsPath != "" {
 			log.Printf("warning: bot rules load failed: %v (using defaults)", err)
 		}
 		if err := runVerify(ctx, *inPath, *outPath, *workers); err != nil {
@@ -126,7 +131,101 @@ DONE:
 	return nil
 }
 
-// ---------- STAGE 2: verify ----------
+// ---------- STAGE 2: enrich ----------
+func runEnrich(ctx context.Context, inPath, outPath string) error {
+	in, err := iox.OpenAuto(inPath)
+	if err != nil {
+		return fmt.Errorf("open input: %w", err)
+	}
+	defer in.Close()
+
+	out, err := iox.CreateAuto(outPath)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer out.Close()
+
+	reader := csvin.New(in, csvin.Options{Comma: ',', TrimSpace: true})
+	header, _, err := reader.Header()
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
+	}
+
+	writer := csvout.New(out)
+	if err := writer.WriteHeader(schema.BaseHeader()); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+
+	has := func(name string) bool {
+		for _, h := range header {
+			if h == name {
+				return true
+			}
+		}
+		return false
+	}
+	if !has("target") {
+		log.Printf("warning: 'target' column not found")
+	}
+
+	var rowsIn, rowsOut, bad int64
+	start := time.Now()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			log.Printf("enrich progress: in=%d out=%d bad=%d", rowsIn, rowsOut, bad)
+		default:
+			row, err := reader.Next()
+			if err != nil {
+				if err == io.EOF {
+					goto DONE
+				}
+				bad++
+				continue
+			}
+			rowsIn++
+
+			// 1) target -> klasifikacija resursa (koristimo 'target', fallback na 'referring_page')
+			url := row["target"]
+			if url == "" {
+				url = row["referring_page"]
+			}
+			class := enrich.ResourceTypeFromURL(url)
+			row["target"] = class
+
+			// 2) referrer => "Direct Hit" ako je prazan a postoji referring_page
+			ref := strings.TrimSpace(row["referrer"])
+			refpg := strings.TrimSpace(row["referring_page"])
+			if (ref == "" || ref == "-") && refpg != "" && refpg != "-" {
+				row["referrer"] = "Direct Hit"
+			}
+
+			// upiši red u istom rasporedu kolona
+			outRow := make([]string, len(schema.BaseColumns))
+			for i, c := range schema.BaseColumns {
+				outRow[i] = row[c.Name]
+			}
+			if err := writer.WriteRow(outRow); err != nil {
+				return fmt.Errorf("write row: %w", err)
+			}
+			rowsOut++
+		}
+	}
+
+DONE:
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+	log.Printf("enrich done. in=%d out=%d bad=%d time=%s", rowsIn, rowsOut, bad, time.Since(start))
+	return nil
+}
+
+// ---------- STAGE 3: verify ----------
 func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 	log.Printf("verify stage: reading unique IPs from %s", inPath)
 	in, err := iox.OpenAuto(inPath)
@@ -205,7 +304,7 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 }
 
 //
-// ---------- STAGE 3: merge (final.csv + verified.csv) ----------
+// ---------- STAGE 4: merge (final.csv + verified.csv) ----------
 
 func normalizeIPKey(ip string) string {
 	ip = strings.TrimSpace(ip)
