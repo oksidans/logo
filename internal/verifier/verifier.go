@@ -14,8 +14,8 @@ import (
 
 type Result struct {
 	IP       string
-	BotName  string // sada sadrži: DetektovaniBot (ako postoji) + SVI PTR-ovi (spojeni sa '|'), ili "unable to verify bot"
-	Verified bool   // true samo ako je detektovan poznati bot preko botdetector pravila
+	BotName  string // DetektovaniBot|PTR1|PTR2|... ili samo PTR-ovi, ili "unable to verify bot"
+	Verified bool   // true samo ako je poznati bot detektovan (preko botdetector)
 }
 
 // VerifyIPs – parallel reverse DNS lookup with progress channel.
@@ -37,11 +37,9 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 				cancel()
 
 				botNameCombined, verified := combineBotNameAndPtrs(ptrs)
-				// Ako baš ništa nemamo, zabeleži poruku
 				if botNameCombined == "" {
 					botNameCombined = "unable to verify bot"
 				}
-
 				resultsChan <- Result{
 					IP:       ip,
 					BotName:  botNameCombined,
@@ -76,12 +74,10 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 }
 
 // combineBotNameAndPtrs vrati:
-//   - combined string: "<DetectedBot>|<PTR1>|<PTR2>|..." (ako je poznati bot detektovan)
-//     ili samo "<PTR1>|<PTR2>|..." (ako nema detekcije poznatog bota)
-//     ili "" ako nema PTR-ova
-//   - verified: true samo ako je poznati bot detektovan preko botdetector.Match
+// - "<DetectedBot>|<PTR1>|<PTR2>|..." ako je poznati bot nađen,
+// - "<PTR1>|<PTR2>|..." ako nije,
+// - "" ako nema PTR-ova uopšte.
 func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
-	// očisti PTR-ove: trim, bez završne tačke, bez duplikata, sa očuvanjem redosleda
 	clean := make([]string, 0, len(ptrs))
 	seen := make(map[string]struct{}, len(ptrs))
 	for _, p := range ptrs {
@@ -97,7 +93,6 @@ func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 		clean = append(clean, p)
 	}
 
-	// pokušaj detekcije poznatog bota nad PTR-ovima (prvi pogodak je dovoljan)
 	detected := ""
 	for _, p := range clean {
 		if name, ok := botdetector.Match(p); ok {
@@ -106,26 +101,19 @@ func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 		}
 	}
 
-	// sastavi combined string
 	switch {
 	case detected != "" && len(clean) > 0:
-		// DetektovaniBot + svi PTR-ovi
-		combined = detected + "|" + strings.Join(clean, "|")
-		verified = true
+		return detected + "|" + strings.Join(clean, "|"), true
 	case detected != "" && len(clean) == 0:
-		combined = detected
-		verified = true
+		return detected, true
 	case detected == "" && len(clean) > 0:
-		combined = strings.Join(clean, "|")
-		verified = false
+		return strings.Join(clean, "|"), false
 	default:
-		combined = ""
-		verified = false
+		return "", false
 	}
-	return
 }
 
-// WriteResultsCSV writes verification results to CSV.
+// WriteResultsCSV writes verification results to CSV (verified as "1" or "0").
 func WriteResultsCSV(outPath string, results []Result) error {
 	f, err := os.Create(outPath)
 	if err != nil {
@@ -136,14 +124,13 @@ func WriteResultsCSV(outPath string, results []Result) error {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	// host_ip, botName, verified
 	if err := w.Write([]string{"host_ip", "botName", "verified"}); err != nil {
 		return err
 	}
 	for _, r := range results {
-		flag := "false"
+		flag := "0"
 		if r.Verified {
-			flag = "true"
+			flag = "1"
 		}
 		if err := w.Write([]string{r.IP, r.BotName, flag}); err != nil {
 			return err
