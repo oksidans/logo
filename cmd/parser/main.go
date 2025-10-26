@@ -14,6 +14,7 @@ import (
 	"parser/internal/csvout"
 	"parser/internal/enrich"
 	"parser/internal/iox"
+	"parser/internal/mapper"
 	"parser/internal/schema"
 	"parser/internal/verifier"
 )
@@ -74,12 +75,8 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 	defer in.Close()
 
 	reader := csvin.New(in, csvin.Options{Comma: ',', TrimSpace: true})
-	header, _, err := reader.Header()
-	if err != nil {
+	if _, _, err := reader.Header(); err != nil {
 		return err
-	}
-	if len(header) == 0 {
-		return fmt.Errorf("no header found in input CSV")
 	}
 
 	out, err := iox.CreateAuto(outPath)
@@ -93,14 +90,17 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 		return err
 	}
 
-	rowsIn := 0
-	rowsOut := 0
+	var rowsIn, rowsOut int
 	start := time.Now()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-ticker.C:
+			log.Printf("normalize progress: in=%d out=%d", rowsIn, rowsOut)
 		default:
 			row, err := reader.Next()
 			if err != nil {
@@ -112,10 +112,10 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 			}
 			rowsIn++
 
-			outRow := make([]string, len(schema.BaseColumns))
-			for i, c := range schema.BaseColumns {
-				outRow[i] = row[c.Name]
-			}
+			// KLJUČNO: mapiranje iz izvornog CSV-a (npr. ClientIP, ClientRequestURI, ...)
+			// u naš izlazni BaseHeader redosled.
+			outRow := mapper.MapToCSV(row)
+
 			if err := writer.WriteRow(outRow); err != nil {
 				return err
 			}
@@ -205,7 +205,6 @@ func runEnrich(ctx context.Context, inPath, outPath string) error {
 				row["referrer"] = "Direct Hit"
 			}
 
-			// upiši red u istom rasporedu kolona
 			outRow := make([]string, len(schema.BaseColumns))
 			for i, c := range schema.BaseColumns {
 				outRow[i] = row[c.Name]
@@ -228,6 +227,7 @@ DONE:
 // ---------- STAGE 3: verify ----------
 func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 	log.Printf("verify stage: reading unique IPs from %s", inPath)
+
 	in, err := iox.OpenAuto(inPath)
 	if err != nil {
 		return fmt.Errorf("open input: %w", err)
@@ -239,18 +239,38 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 	if err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
-	foundHost := false
-	for _, h := range header {
-		if h == "host_ip" {
-			foundHost = true
-			break
+
+	// helper: nadji prvu postojeću kolonu iz liste kandidata
+	findCol := func(cands ...string) (string, bool) {
+		for _, h := range header {
+			hn := strings.TrimSpace(h)
+			for _, c := range cands {
+				if hn == c {
+					return hn, true
+				}
+			}
 		}
+		return "", false
 	}
-	if !foundHost {
-		return fmt.Errorf("CSV missing 'host_ip' column")
+
+	// primarno očekujemo 'host_ip' iz normalize faze; fallback ako je input neki drugi
+	ipCol, ok := findCol("host_ip", "ClientIP", "client_ip", "ip", "remote_addr")
+	if !ok {
+		return fmt.Errorf("could not find an IP column (tried: host_ip, ClientIP, client_ip, ip, remote_addr)")
+	}
+	log.Printf("verify: using IP column %q", ipCol)
+
+	normalizeIPKey := func(ip string) string {
+		ip = strings.TrimSpace(ip)
+		if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
+			ip = strings.Trim(ip, "[]")
+		}
+		return ip
 	}
 
 	unique := make(map[string]struct{})
+	var totalRows, emptyIPs int
+
 	for {
 		row, err := reader.Next()
 		if err != nil {
@@ -259,17 +279,27 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 			}
 			continue
 		}
-		ip := normalizeIPKey(row["host_ip"])
-		if ip == "" {
+		totalRows++
+
+		ip := normalizeIPKey(row[ipCol])
+		if ip == "" || ip == "-" {
+			emptyIPs++
 			continue
 		}
 		unique[ip] = struct{}{}
 	}
+
 	ips := make([]string, 0, len(unique))
 	for ip := range unique {
 		ips = append(ips, ip)
 	}
-	log.Printf("collected %d unique IPs", len(ips))
+
+	log.Printf("scanned rows=%d, empty_ip=%d, unique_ips=%d", totalRows, emptyIPs, len(ips))
+	if len(ips) == 0 {
+		log.Printf("no IPs found; is %q the correct input file and does column %q contain data?", inPath, ipCol)
+		// napiši prazan verified.csv radi konzistentnosti
+		return verifier.WriteResultsCSV(outPath, nil)
+	}
 
 	progress := make(chan int, 100)
 	go func() {
@@ -465,7 +495,7 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string) erro
 
 			outRow := make([]string, len(schema.BaseColumns))
 			for i, c := range schema.BaseColumns {
-				outRow[i] = row[c.Name] // protocol ostaje kakav je bio
+				outRow[i] = row[c.Name]
 			}
 			if err := writer.WriteRow(outRow); err != nil {
 				return fmt.Errorf("write row: %w", err)
