@@ -20,8 +20,8 @@ var (
 	outPath  = flag.String("out", "", "Output CSV file path")
 	botsPath = flag.String("bots", "", "Optional path to bots config (JSON or YAML)")
 	stage    = flag.String("stage", "", "Stage to run: normalize | enrich | verify")
-	plan     = flag.Bool("plan", false, "If true, show column plan and exit")
-	workers  = flag.Int("workers", 15, "Number of parallel DNS workers for verify stage")
+	//plan     = flag.Bool("plan", false, "If true, show column plan and exit")
+	workers = flag.Int("workers", 15, "Number of parallel DNS workers for verify stage")
 )
 
 func main() {
