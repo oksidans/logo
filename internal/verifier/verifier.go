@@ -136,12 +136,10 @@ func WriteResultsCSV(outPath string, results []Result) error {
 	w := csv.NewWriter(f)
 	defer w.Flush()
 
-	// header
+	// host_ip, botName, verified
 	if err := w.Write([]string{"host_ip", "botName", "verified"}); err != nil {
 		return err
 	}
-
-	// rows
 	for _, r := range results {
 		flag := "false"
 		if r.Verified {
@@ -151,10 +149,5 @@ func WriteResultsCSV(outPath string, results []Result) error {
 			return err
 		}
 	}
-
-	// final check
-	if err := w.Error(); err != nil {
-		return err
-	}
-	return nil
+	return w.Error()
 }
