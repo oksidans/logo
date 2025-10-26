@@ -1,0 +1,49 @@
+# Ovaj workflow će kompajlirati i testirati Go projekat.
+
+name: Go CI
+
+on:
+  push:
+    # Pokreni pri push-u na main granu
+    branches: [ "main" ]
+  pull_request:
+    # Pokreni pri otvaranju ili ažuriranju PR-a prema main grani
+    branches: [ "main" ]
+  # Opciono: omogućava ručno pokretanje workflow-a sa GitHub UI-a
+  workflow_dispatch:
+
+jobs:
+  # === BUILD I TEST FAZA ===
+  build-and-test:
+    # Preporučuje se upotreba najnovije LTS verzije Ubuntua
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      # Standardna akcija za preuzimanje koda
+      uses: actions/checkout@v4
+
+    - name: Set up Go Environment
+      uses: actions/setup-go@v4
+      with:
+        # Preporučuje se da se koristi najnovija stabilna verzija (ili vaša potrebna verzija)
+        go-version: '1.22' # Ažurirano na noviju verziju
+
+    - name: Download Go modules
+      # Obavezno za preuzimanje zavisnosti pre builda/testiranja
+      run: go mod download
+
+    - name: Run Go tests
+      # Bolje je staviti testove pre builda da brže dobijete fidbek
+      run: go test -v -race -coverprofile=coverage.out ./...
+
+    - name: Run static analysis (linters)
+      # Preporučeno: Koristite linter da proverite stil i potencijalne greške
+      uses: golangci/golangci-lint-action@v4
+      with:
+        # Podesite na true da se provera ne pokrene ako nema fajlova za analizu
+        only-new-issues: true
+
+    - name: Build Project
+      # Kompajlira projekat nakon što prođu testovi i linting
+      run: go build -v ./...
