@@ -288,14 +288,19 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string) erro
 		if ip == "" {
 			continue
 		}
-		vflag := "0"
+
+		var vflag string
 		switch strings.TrimSpace(row["verified"]) {
 		case "1", "true", "TRUE", "True", "yes", "y":
 			vflag = "1"
 		default:
 			vflag = "0"
 		}
-		verMap[ip] = verPair{name: strings.TrimSpace(row["botName"]), flag: vflag}
+
+		verMap[ip] = verPair{
+			name: strings.TrimSpace(row["botName"]),
+			flag: vflag,
+		}
 	}
 
 	in, err := iox.OpenAuto(finalPath)
