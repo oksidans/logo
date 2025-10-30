@@ -10,49 +10,95 @@ import (
 	"strings"
 	"time"
 
+	"parser/internal/aibots"
 	"parser/internal/botdetector"
 	"parser/internal/csvin"
 	"parser/internal/csvout"
 	"parser/internal/enrich"
 	"parser/internal/iox"
+	"parser/internal/jsonl"
 	"parser/internal/mapper"
 	"parser/internal/schema"
 	"parser/internal/verifier"
 )
 
-func main() {
-	inPath := flag.String("in", "", "Input CSV file path")
-	outPath := flag.String("out", "", "Output CSV file path")
-	stage := flag.String("stage", "normalize", "Stage: normalize | enrich | verify | merge")
-	botsPath := flag.String("bots", "", "Bot rules file (.json or .yaml)")
-	workers := flag.Int("workers", 15, "Number of parallel DNS lookup workers (verify stage only)")
-	showPlan := flag.Bool("plan", false, "Show plan and exit (for debugging)")
-	uaPtrVerify := flag.Bool("ua-ptr-verify", false, "If true, mark verified=1 when UA and PTR share the same base domain (heuristic)")
+var version = "v1.4"
 
+func main() {
+	// Common I/O + stage
+	inPath := flag.String("in", "", "Input file path")
+	outPath := flag.String("out", "", "Output file path")
+	stage := flag.String("stage", "normalize", "Stage: jsonl | normalize | enrich | verify | merge | aibots")
+
+	// JSONL acceleration flags
+	jsonlWorkers := flag.Int("jsonl-workers", 8, "Number of workers for jsonl stage")
+	jsonlTempDir := flag.String("jsonl-temp", "", "Temp dir for jsonl stage (default: system temp)")
+	jsonlBuf := flag.Int("jsonl-buf", 8192, "Buffered jobs (lines) for jsonl stage")
+
+	// Verify / Merge flags
+	botsPath := flag.String("bots", "", "Bot rules file (.json or .yaml)")
+	workers := flag.Int("workers", 15, "Number of parallel DNS lookup workers (verify stage)")
+	uaPtrVerify := flag.Bool("ua-ptr-verify", false, "Mark verified=1 when UA and PTR share same base domain (heuristic)")
+
+	// Mapper fallback for http/https when ClientRequestScheme is missing
+	defaultScheme := flag.String("default-scheme", "https", "Fallback scheme when ClientRequestScheme is missing (http or https)")
+
+	showPlan := flag.Bool("plan", false, "Show plan and exit")
 	flag.Parse()
 
+	// Plumb default scheme to mapper (used in protocol + absolute URL construction)
+	mapper.SetDefaultScheme(strings.ToLower(strings.TrimSpace(*defaultScheme)))
+
 	if *showPlan {
-		fmt.Println("=== PLAN ===")
-		fmt.Printf("Stage  : %s\n", *stage)
-		fmt.Printf("Input  : %s\n", *inPath)
-		fmt.Printf("Output : %s\n", *outPath)
-		fmt.Printf("Workers: %d\n", *workers)
-		fmt.Printf("Bots   : %s\n", *botsPath)
-		fmt.Printf("UA↔PTR Heuristic: %v\n", *uaPtrVerify)
+		fmt.Printf("==== Parser %s Execution Plan ====\n", version)
+		fmt.Printf("Stage              : %s\n", *stage)
+		fmt.Printf("Input              : %s\n", *inPath)
+		fmt.Printf("Output             : %s\n", *outPath)
+		fmt.Printf("Bots rules         : %s\n", *botsPath)
+		fmt.Printf("Workers (DNS)      : %d\n", *workers)
+		fmt.Printf("UA↔PTR verify      : %v\n", *uaPtrVerify)
+		fmt.Printf("JSONL workers      : %d\n", *jsonlWorkers)
+		fmt.Printf("JSONL tempdir      : %s\n", *jsonlTempDir)
+		fmt.Printf("JSONL bufsize      : %d\n", *jsonlBuf)
+		fmt.Printf("Default scheme     : %s\n", *defaultScheme)
 		return
 	}
+
+	start := time.Now()
+	defer func() {
+		log.Printf("⏱️ completed in %v", time.Since(start))
+	}()
 
 	ctx := context.Background()
 
 	switch *stage {
+	case "jsonl":
+		err := jsonl.ConvertJSONLToCSVConcurrent(
+			*inPath,
+			*outPath,
+			jsonl.Options{
+				Workers:  *jsonlWorkers,
+				TempDir:  *jsonlTempDir,
+				BufLines: *jsonlBuf,
+			},
+		)
+		if err != nil {
+			log.Fatalf("jsonl stage: %v", err)
+		}
+		log.Println("✅ JSONL → CSV conversion complete")
+
 	case "normalize":
 		if err := runNormalize(ctx, *inPath, *outPath); err != nil {
 			log.Fatal(err)
 		}
+		log.Println("✅ Normalization complete")
+
 	case "enrich":
 		if err := runEnrich(ctx, *inPath, *outPath); err != nil {
 			log.Fatal(err)
 		}
+		log.Println("✅ Enrichment complete")
+
 	case "verify":
 		if err := botdetector.InitFromFile(*botsPath); err != nil && *botsPath != "" {
 			log.Printf("warning: bot rules load failed: %v (using defaults)", err)
@@ -60,10 +106,20 @@ func main() {
 		if err := runVerify(ctx, *inPath, *outPath, *workers); err != nil {
 			log.Fatal(err)
 		}
+		log.Println("✅ DNS verification complete")
+
 	case "merge":
 		if err := runMerge(ctx, "final.csv", "verified.csv", *outPath, *uaPtrVerify); err != nil {
 			log.Fatal(err)
 		}
+		log.Println("✅ Merge complete")
+
+	case "aibots":
+		if err := runAIBots(ctx, *inPath, *outPath); err != nil {
+			log.Fatal(err)
+		}
+		log.Println("✅ AI-bots tagging complete")
+
 	default:
 		log.Fatalf("unknown stage: %s", *stage)
 	}
@@ -132,9 +188,7 @@ func runNormalize(ctx context.Context, inPath, outPath string) error {
 			}
 			rowsIn++
 
-			// KLJUČNO: mapiranje (ClientIP, ClientRequestURI, ...) -> schema.BaseHeader()
 			outRow := mapper.MapToCSV(row)
-
 			if err := writer.WriteRow(outRow); err != nil {
 				return fmt.Errorf("write row: %w", err)
 			}
@@ -168,7 +222,7 @@ func runEnrich(ctx context.Context, inPath, outPath string) error {
 	defer out.Close()
 
 	reader := csvin.New(in, csvin.Options{Comma: ',', TrimSpace: true})
-	header, _, err := reader.Header()
+	_, _, err = reader.Header() // skip input header
 	if err != nil {
 		return fmt.Errorf("read header: %w", err)
 	}
@@ -176,18 +230,6 @@ func runEnrich(ctx context.Context, inPath, outPath string) error {
 	writer := csvout.New(out)
 	if err := writer.WriteHeader(schema.BaseHeader()); err != nil {
 		return fmt.Errorf("write header: %w", err)
-	}
-
-	has := func(name string) bool {
-		for _, h := range header {
-			if h == name {
-				return true
-			}
-		}
-		return false
-	}
-	if !has("target") {
-		log.Printf("warning: 'target' column not found")
 	}
 
 	var rowsIn, rowsOut, bad int64
@@ -212,15 +254,14 @@ func runEnrich(ctx context.Context, inPath, outPath string) error {
 			}
 			rowsIn++
 
-			// 1) target -> klasifikacija resursa (koristi 'target', fallback na 'referring_page')
+			// 1) target classification
 			url := row["target"]
 			if url == "" {
 				url = row["referring_page"]
 			}
-			class := enrich.ResourceTypeFromURL(url)
-			row["target"] = class
+			row["target"] = enrich.ResourceTypeFromURL(url)
 
-			// 2) referrer => "Direct Hit" ako je prazan a postoji referring_page
+			// 2) referrer => "Direct Hit" if empty but referring_page is set
 			ref := strings.TrimSpace(row["referrer"])
 			refpg := strings.TrimSpace(row["referring_page"])
 			if (ref == "" || ref == "-") && refpg != "" && refpg != "-" {
@@ -300,7 +341,6 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 			continue
 		}
 		totalRows++
-
 		ip := normalizeIPKey(row[ipCol])
 		if ip == "" || ip == "-" {
 			emptyIPs++
@@ -316,7 +356,6 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 
 	log.Printf("scanned rows=%d, empty_ip=%d, unique_ips=%d", totalRows, emptyIPs, len(ips))
 	if len(ips) == 0 {
-		log.Printf("no IPs found; is %q the correct input file and does column %q contain data?", inPath, ipCol)
 		return verifier.WriteResultsCSV(outPath, nil)
 	}
 
@@ -352,9 +391,7 @@ func runVerify(ctx context.Context, inPath, outPath string, workers int) error {
 	return nil
 }
 
-//
-// ---------- STAGE 4: merge (final.csv + verified.csv) ----------
-
+// ---------- Helpers for merge ----------
 func normalizeIPKey(ip string) string {
 	ip = strings.TrimSpace(ip)
 	if strings.HasPrefix(ip, "[") && strings.HasSuffix(ip, "]") {
@@ -392,7 +429,7 @@ func uniqJoinPipe(a, b string) string {
 	return strings.Join(out, "|")
 }
 
-// UA↔PTR domen poklapanje (heuristika): ako UA sadrži hostname(ove) čiji je base domen isti kao neki iz PTR-ova, vrati true.
+// UA↔PTR base-domain match (heuristic)
 func uaPtrSameBaseDomain(ua, ptrBlob string) bool {
 	if ua == "" || ptrBlob == "" {
 		return false
@@ -416,7 +453,6 @@ func uaPtrSameBaseDomain(ua, ptrBlob string) bool {
 	return false
 }
 
-// Grubo iz UA izvlači kandidate za host/domene (npr. crawl-xxx.mj12bot.com)
 func extractDomainsFromUA(ua string) []string {
 	ua = strings.ToLower(ua)
 	re := regexp.MustCompile(`([a-z0-9][a-z0-9\-]*\.)+[a-z]{2,}`)
@@ -439,7 +475,6 @@ func hostFromAny(s string) string {
 	return s
 }
 
-// “Base” domen (poslednje 2 labele). Dovoljno za tipične slučajeve (mj12bot.com, google.com, msn.com)
 func baseDomain(host string) string {
 	if host == "" {
 		return ""
@@ -451,6 +486,7 @@ func baseDomain(host string) string {
 	return parts[len(parts)-2] + "." + parts[len(parts)-1]
 }
 
+// ---------- STAGE 4: merge ----------
 func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPtrVerify bool) error {
 	type verPair struct {
 		name string
@@ -458,6 +494,7 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPt
 	}
 	verMap := make(map[string]verPair, 1<<16)
 
+	// Load verified.csv -> map[IP]verPair
 	vIn, err := iox.OpenAuto(verifiedPath)
 	if err != nil {
 		return fmt.Errorf("open verified: %w", err)
@@ -483,6 +520,7 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPt
 	if !hasHost || !hasBN || !hasVF {
 		return fmt.Errorf("verified.csv must contain 'host_ip','botName','verified'")
 	}
+
 	for {
 		row, err := vReader.Next()
 		if err == io.EOF {
@@ -510,6 +548,7 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPt
 		}
 	}
 
+	// Open final.csv and prepare output
 	in, err := iox.OpenAuto(finalPath)
 	if err != nil {
 		return fmt.Errorf("open final: %w", err)
@@ -566,15 +605,15 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPt
 
 			ipKey := normalizeIPKey(row["host_ip"])
 			if p, ok := verMap[ipKey]; ok {
-				// botName = union (uniq) postojećeg i iz verified.csv
+				// Merge bot names (union, pipe-delimited)
 				row["botName"] = uniqJoinPipe(row["botName"], p.name)
-				// verified = "1"/"0" iz verified.csv
+				// Verified from verified.csv
 				row["verified"] = p.flag
 
-				// Heuristika: ako verified==0, a UA i PTR dele isti base domen -> verified=1 (ako je flag uključen)
+				// Optional heuristic: UA↔PTR base-domain match => verified=1
 				if uaPtrVerify && row["verified"] != "1" {
 					ua := strings.ToLower(row["user_agent"])
-					ptrBlob := strings.ToLower(row["botName"]) // PTR-ovi + eventualno ime bota
+					ptrBlob := strings.ToLower(row["botName"])
 					if uaPtrSameBaseDomain(ua, ptrBlob) {
 						row["verified"] = "1"
 					}
@@ -584,7 +623,7 @@ func runMerge(ctx context.Context, finalPath, verifiedPath, outPath string, uaPt
 
 			outRow := make([]string, len(schema.BaseColumns))
 			for i, c := range schema.BaseColumns {
-				outRow[i] = row[c.Name] // protocol ostaje kakav je bio
+				outRow[i] = row[c.Name]
 			}
 			if err := writer.WriteRow(outRow); err != nil {
 				return fmt.Errorf("write row: %w", err)
@@ -598,5 +637,92 @@ DONE:
 		return fmt.Errorf("flush: %w", err)
 	}
 	log.Printf("merge done. in=%d out=%d patched=%d time=%s", rowsIn, rowsOut, patched, time.Since(start))
+	return nil
+}
+
+// ---------- STAGE 5: aibots ----------
+// Ulaz: merged.csv; Izlaz: merged_ai.csv
+// Dodaje novu kolonu "AiBots". Ako UA sadrži neku AI-liniju, upisuje PRVU prepoznatu; inače '-'.
+func runAIBots(ctx context.Context, inPath, outPath string) error {
+	if inPath == "" || outPath == "" {
+		return fmt.Errorf("aibots: --in and --out are required")
+	}
+	if inPath == outPath {
+		return fmt.Errorf("aibots: input and output paths must differ (got %q)", inPath)
+	}
+
+	in, err := iox.OpenAuto(inPath)
+	if err != nil {
+		return fmt.Errorf("open input: %w", err)
+	}
+	defer in.Close()
+
+	out, err := iox.CreateAuto(outPath)
+	if err != nil {
+		return fmt.Errorf("create output: %w", err)
+	}
+	defer out.Close()
+
+	reader := csvin.New(in, csvin.Options{Comma: ',', TrimSpace: true})
+	_, _, err = reader.Header()
+	if err != nil {
+		return fmt.Errorf("read header: %w", err)
+	}
+
+	// Header = BaseHeader + AiBots
+	base := schema.BaseHeader()
+	outHeader := append(append([]string(nil), base...), "AiBots")
+
+	writer := csvout.New(out)
+	if err := writer.WriteHeader(outHeader); err != nil {
+		return fmt.Errorf("write header: %w", err)
+	}
+
+	var rowsIn, rowsOut, tagged int64
+	start := time.Now()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			log.Printf("aibots progress: in=%d out=%d tagged=%d", rowsIn, rowsOut, tagged)
+		default:
+			row, err := reader.Next()
+			if err != nil {
+				if err == io.EOF {
+					goto DONE
+				}
+				continue
+			}
+			rowsIn++
+
+			ai := "-"
+			if found := aibots.Detect(row["user_agent"]); len(found) > 0 {
+				ai = found[0] // prva detekcija radi preglednosti
+				tagged++
+			}
+
+			// out row = BaseColumns order + AiBots kao poslednja kolona
+			outRow := make([]string, 0, len(base)+1)
+			for _, c := range schema.BaseColumns {
+				outRow = append(outRow, row[c.Name])
+			}
+			outRow = append(outRow, ai)
+
+			if err := writer.WriteRow(outRow); err != nil {
+				return fmt.Errorf("write row: %w", err)
+			}
+			rowsOut++
+		}
+	}
+
+DONE:
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush: %w", err)
+	}
+	log.Printf("aibots done. in=%d out=%d tagged=%d time=%s", rowsIn, rowsOut, tagged, time.Since(start))
 	return nil
 }
