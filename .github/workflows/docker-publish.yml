@@ -13,6 +13,7 @@ jobs:
   build-and-push-docker-image:
     runs-on: ubuntu-latest
     
+    # Dozvole su potrebne za pristup secrets-ima i čitanje koda
     permissions:
       contents: read
       packages: write
@@ -26,16 +27,21 @@ jobs:
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
+        # Koristimo DOCKER_USERNAME i DOCKER_TOKEN iz secrets-a 
+        # i prosleđujemo ih akciji preko env varijabli.
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_TOKEN }}
         with:
-          # KORISTI TAJNE (SECRETS) koje ste uneli na GitHubu
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
+          # Akcija koristi env varijable za prijavu
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
 
       - name: Extract metadata (tags) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # Korisnik/Ime_Aplikacije (npr. m1l1/logo)
+          # Format image-a: m1l1/logo
           images: ${{ secrets.DOCKER_USERNAME }}/logo
           tags: |
             type=semver,pattern={{version}}
@@ -44,10 +50,9 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: . # Koristi folder gde je Dockerfile
+          context: . 
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Koristimo Multi-stage build cache
           cache-from: type=gha 
           cache-to: type=gha,mode=max
