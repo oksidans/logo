@@ -1,3 +1,5 @@
+# Fajl: .github/workflows/docker-publish.yml
+
 name: Docker Publish to Hub
 
 # Pokreće se SAMO kada se kreira novi Git tag
@@ -11,9 +13,10 @@ jobs:
   build-and-push-docker-image:
     runs-on: ubuntu-latest
     
-    # Dozvole su potrebne za čitanje koda
+    # Dozvole su potrebne za pristup secrets-ima i čitanje koda
     permissions:
       contents: read
+      packages: write
 
     steps:
       - name: Checkout Code
@@ -24,18 +27,21 @@ jobs:
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
+        # Koristimo DOCKER_USERNAME i DOCKER_TOKEN iz secrets-a 
+        # i prosleđujemo ih akciji preko env varijabli.
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_TOKEN }}
         with:
-          # Očekuje se da u repo secrets postoje:
-          # DOCKER_USERNAME (npr. m1l1)
-          # DOCKER_TOKEN   (Docker Hub Access Token)
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
+          # Akcija koristi env varijable za prijavu
+          username: ${{ env.DOCKER_USERNAME }}
+          password: ${{ env.DOCKER_PASSWORD }}
 
       - name: Extract metadata (tags) for Docker
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # Format image-a: <username>/logo, npr: m1l1/logo
+          # Format image-a: m1l1/logo
           images: ${{ secrets.DOCKER_USERNAME }}/logo
           tags: |
             type=semver,pattern={{version}}
@@ -50,4 +56,3 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha 
           cache-to: type=gha,mode=max
-
