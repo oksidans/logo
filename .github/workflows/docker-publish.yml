@@ -1,53 +1,40 @@
-# Fajl: .github/workflows/docker-publish.yml
+name: Docker Build & Push
 
-name: Docker Publish to Hub
-
-# Pokreće se SAMO kada se kreira novi Git tag
 on:
   push:
-    tags:
-      # Reaguje na tagove poput v1.0.0, v2.5.1
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: [ "main" ]  # za test; kasnije možeš da prebaciš na tagove
 
 jobs:
-  build-and-push-docker-image:
+  build-and-push:
     runs-on: ubuntu-latest
-    
-    # Dozvole: Postavljene na 'read' i 'write'
-    permissions:
-      contents: read
-      packages: write
+
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
 
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          # Potrebno za pravilno čitanje Git taga
-          fetch-depth: 0
 
-      - name: Log in to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          # Ovo MORA da se poklapa sa imenima tajni (secrets)
-          username: ${{ secrets.DOCKER_USERNAME }}
-          password: ${{ secrets.DOCKER_TOKEN }}
+      - name: Check Docker secrets
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ]; then
+            echo "❌ DOCKERHUB_USERNAME je prazan ili ne postoji kao secret"
+            exit 1
+          fi
+          if [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "❌ DOCKERHUB_TOKEN je prazan ili ne postoji kao secret"
+            exit 1
+          fi
+          echo "✅ Secrets DOCKERHUB_USERNAME i DOCKERHUB_TOKEN postoje"
 
-      - name: Extract metadata (tags) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          # Koristimo DOCKER_USERNAME za ime Image-a
-          images: ${{ secrets.DOCKER_USERNAME }}/logo
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable={{is_latest}}
+      - name: Log in to Docker Hub (CLI)
+        run: |
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: . # Koristi folder gde je Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha 
-          cache-to: type=gha,mode=max
+      - name: Build and push image
+        run: |
+          IMAGE_NAME="$DOCKERHUB_USERNAME/logo:latest"
+          echo "📦 Gradi se image: $IMAGE_NAME"
+          docker build -t "$IMAGE_NAME" .
+          docker push "$IMAGE_NAME"
