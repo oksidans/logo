@@ -22,19 +22,23 @@ import (
 func main() {
 	// CLI flags
 	var (
-		flagProjectID int64
-		flagMonth     int
-		flagYear      int
-		flagCSV       string
-		flagDryRun    bool
-		flagCheck     bool
+		flagProjectID      int64
+		flagMonth          int
+		flagYear           int
+		flagCSV            string
+		flagDryRun         bool
+		flagCheck          bool
+		flagAllowOverwrite bool
+		flagWriteStats     bool // ako je false -> meta-only run
 	)
-	flag.Int64Var(&flagProjectID, "project-id", 0, "Target project_id (default: active project with is_active=1)")
+	flag.Int64Var(&flagProjectID, "project-id", 0, "Explicit target project_id (default: pick newest inactive empty row)")
 	flag.IntVar(&flagMonth, "month", 0, "Target month (1..12). If 0, autodetect from CSV")
 	flag.IntVar(&flagYear, "year", 0, "Target year. If 0, autodetect from CSV")
 	flag.StringVar(&flagCSV, "csv", "", "Path to CSV (default from .env CSV_PATH)")
 	flag.BoolVar(&flagDryRun, "dry-run", false, "Do not write to DB (just aggregate and log)")
 	flag.BoolVar(&flagCheck, "check-schema", false, "Only check schema and exit")
+	flag.BoolVar(&flagAllowOverwrite, "allow-overwrite", false, "Allow overwriting project meta if already set")
+	flag.BoolVar(&flagWriteStats, "write-stats", false, "Write inserts to stats tables (general/sitemap/aibots). If false, meta-only")
 	flag.Parse()
 
 	// Config + DB
@@ -71,13 +75,13 @@ func main() {
 		return
 	}
 
-	// project_id (auto ako nije zadat)
-	if flagProjectID == 0 {
+	// project_id (auto ako nije zadat — uzmi najnoviji neaktivan prazan red)
+	{
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		pid, err := project.GetActiveProjectIDForUpdate(ctx, conn)
+		pid, err := project.GetTargetProjectID(ctx, conn, flagProjectID)
 		if err != nil {
-			log.Fatalf("active project error: %v", err)
+			log.Fatalf("resolve project_id error: %v", err)
 		}
 		flagProjectID = pid
 	}
@@ -132,29 +136,20 @@ func main() {
 		useYear = flagYear
 	}
 
-	// 2) Streaming agregacija sa filtriranjem po (useMonth,useYear)
+	// 2) Streaming agregacija sa filtriranjem po (useMonth,useYear) — UTC window
 	agg := aggregators.NewAggregateBucket()
-	dbg := &csvx.DebugInfo{} // prosleđujemo DebugInfo
+	dbg := &csvx.DebugInfo{} // za operativni debug iz streama
 	if err := csvx.StreamAndAggregate(cfg.CSVPath, useMonth, useYear, agg, dbg); err != nil {
 		log.Fatalf("aggregate stream error: %v", err)
 	}
-
-	// Logovi o “prozorima”/metapodacima
 	if flagMonth != 0 && flagYear != 0 {
-		// granice prozora u UTC
 		winStart, winEnd := util.MonthWindowUTC(useYear, useMonth)
-		// end učini vizuelno inkluzivnim (00:00 sledećeg meseca - 1s)
-		winEnd = winEnd.Add(-time.Second)
-
+		winEnd = winEnd.Add(-time.Second) // vizuelno inkluzivno
 		log.Printf("[INFO] meta_mode=filtered min=%s max=%s rows=%d",
 			winStart.Format("2006-01-02 15:04:05"),
 			winEnd.Format("2006-01-02 15:04:05"),
 			agg.FilteredRows,
 		)
-
-		// Operativni debug iz DebugInfo
-		log.Printf("[DEBUG] read=%d skip_month=%d parse_err=%d no_method=%d no_status=%d header=%v",
-			dbg.TotalRead, dbg.SkipWrongMonth, dbg.SkipParseErr, dbg.SkipNoMethod, dbg.SkipNoStatus, dbg.LastHeader)
 	} else {
 		log.Printf("[INFO] month=%d year=%d rows=%d start=%s end=%s",
 			useMonth, useYear, stats.Rows,
@@ -163,7 +158,11 @@ func main() {
 		)
 	}
 
-	// 3) Meta za update projekta: filtrirano ako su eksplicitno zadati mesec/godina
+	// Operativni debug iz DebugInfo
+	log.Printf("[DEBUG] read=%d skip_month=%d parse_err=%d no_method=%d no_status=%d header=%v",
+		dbg.TotalRead, dbg.SkipWrongMonth, dbg.SkipParseErr, dbg.SkipNoMethod, dbg.SkipNoStatus, dbg.LastHeader)
+
+	// 3) Meta za update projekta: koristimo filtrirani prozor ako su mesec/godina eksplicitni i postoje podaci
 	var metaMin, metaMax time.Time
 	var metaRows int64
 	if flagMonth != 0 && flagYear != 0 && agg.FilteredRows > 0 && !agg.MinTS.IsZero() && !agg.MaxTS.IsZero() {
@@ -178,10 +177,10 @@ func main() {
 		log.Printf("[INFO] meta_mode=auto (using full CSV stats)")
 	}
 
-	// 4) Update project meta
+	// 4) Update project meta (SAFE)
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		err = project.UpdateProjectMeta(ctx, conn, flagProjectID, metaMin, metaMax, metaRows)
+		err = project.UpdateProjectMetaSafe(ctx, conn, flagProjectID, metaMin, metaMax, metaRows, flagAllowOverwrite)
 		cancel()
 		if err != nil {
 			log.Fatalf("update project meta error: %v", err)
@@ -189,12 +188,19 @@ func main() {
 		log.Printf("[OK] logana_project updated (id=%d)", flagProjectID)
 	}
 
-	// 5) Ako je dry-run -> samo izveštaj
+	// 5) Ako je dry-run -> samo izveštaj i izlaz
 	if flagDryRun {
 		log.Printf("[DRY] filtered_rows=%d methods=%d respCodes=%d sitemap=%d aiBots=%d",
 			agg.FilteredRows, len(agg.MethodCounts), len(agg.StatusCounts), agg.SitemapCount, len(agg.AIBotCounts),
 		)
 		log.Printf("[DONE] Dry-run finished.")
+		return
+	}
+
+	// 6) Ako ne želimo stats inserte u ovom run-u, završavamo posle meta
+	if !flagWriteStats {
+		log.Printf("[SKIP] stats inserts disabled (run with -write-stats to insert into general/sitemap/aibots).")
+		log.Printf("[DONE] Meta-only run finished.")
 		return
 	}
 
@@ -209,7 +215,7 @@ func main() {
 		}
 	}
 
-	// 6a) general INSERTs
+	// 7a) general INSERTs
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
@@ -227,7 +233,7 @@ func main() {
 		log.Printf("[OK] general inserts done")
 	}
 
-	// 6b) sitemap INSERTs
+	// 7b) sitemap INSERTs
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -243,7 +249,7 @@ func main() {
 		log.Printf("[OK] sitemap inserts done")
 	}
 
-	// 6c) AI bot INSERTs (ako tabela postoji)
+	// 7c) AI bot INSERTs (ako tabela postoji)
 	{
 		if !hasAIBots {
 			log.Printf("[SKIP] ln_aiBotHitsByName not present — skipping aibot inserts")
@@ -264,7 +270,7 @@ func main() {
 		}
 	}
 
-	// 7) Finalizacija projekta (is_active=0)
+	// 8) Finalizacija projekta (is_active=0) — radimo tek posle svih inserta
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		err = project.MarkInactive(ctx, conn, flagProjectID)
