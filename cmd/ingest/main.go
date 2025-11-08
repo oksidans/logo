@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"strconv"
 	"time"
@@ -22,23 +21,21 @@ import (
 func main() {
 	// CLI flags
 	var (
-		flagProjectID      int64
-		flagMonth          int
-		flagYear           int
-		flagCSV            string
-		flagDryRun         bool
-		flagCheck          bool
-		flagAllowOverwrite bool
-		flagWriteStats     bool // ako je false -> meta-only run
+		flagProjectID int64
+		flagMonth     int
+		flagYear      int
+		flagCSV       string
+		flagDryRun    bool
+		flagCheck     bool
+		flagOnlyProj  bool
 	)
-	flag.Int64Var(&flagProjectID, "project-id", 0, "Explicit target project_id (default: pick newest inactive empty row)")
+	flag.Int64Var(&flagProjectID, "project-id", 0, "Target project_id (default: pick an inactive placeholder automatically)")
 	flag.IntVar(&flagMonth, "month", 0, "Target month (1..12). If 0, autodetect from CSV")
 	flag.IntVar(&flagYear, "year", 0, "Target year. If 0, autodetect from CSV")
 	flag.StringVar(&flagCSV, "csv", "", "Path to CSV (default from .env CSV_PATH)")
 	flag.BoolVar(&flagDryRun, "dry-run", false, "Do not write to DB (just aggregate and log)")
 	flag.BoolVar(&flagCheck, "check-schema", false, "Only check schema and exit")
-	flag.BoolVar(&flagAllowOverwrite, "allow-overwrite", false, "Allow overwriting project meta if already set")
-	flag.BoolVar(&flagWriteStats, "write-stats", false, "Write inserts to stats tables (general/sitemap/aibots). If false, meta-only")
+	flag.BoolVar(&flagOnlyProj, "only-project", false, "Only update logana_project (no inserts into other tables)")
 	flag.Parse()
 
 	// Config + DB
@@ -75,20 +72,20 @@ func main() {
 		return
 	}
 
-	// project_id (auto ako nije zadat — uzmi najnoviji neaktivan prazan red)
-	{
+	// project_id (auto ako nije zadat): biramo placeholder koji je neaktivan
+	if flagProjectID == 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		pid, err := project.GetTargetProjectID(ctx, conn, flagProjectID)
+		pid, err := project.SelectTargetProject(ctx, conn)
 		if err != nil {
-			log.Fatalf("resolve project_id error: %v", err)
+			log.Fatalf("select placeholder project error: %v", err)
 		}
 		flagProjectID = pid
 	}
 	log.Printf("[INFO] project_id=%d", flagProjectID)
 
 	// DB lock (kratak timeout)
-	lockKey := fmt.Sprintf("logana_ingest_%d", flagProjectID)
+	lockKey := "logana_ingest_" + strconv.FormatInt(flagProjectID, 10)
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		got, err := lock.Get(ctx, conn, lockKey, 10)
@@ -102,7 +99,7 @@ func main() {
 		defer func() { _ = lock.Release(context.Background(), conn, lockKey) }()
 	}
 
-	// 0) Schema guard
+	// 0) Schema guard (samo required)
 	var (
 		hasRequired bool
 		hasAIBots   bool
@@ -136,33 +133,35 @@ func main() {
 		useYear = flagYear
 	}
 
-	// 2) Streaming agregacija sa filtriranjem po (useMonth,useYear) — UTC window
+	// 2) Streaming agregacija sa filtriranjem po (useMonth,useYear)
 	agg := aggregators.NewAggregateBucket()
-	dbg := &csvx.DebugInfo{} // za operativni debug iz streama
+	dbg := &csvx.DebugInfo{Enabled: true}
 	if err := csvx.StreamAndAggregate(cfg.CSVPath, useMonth, useYear, agg, dbg); err != nil {
 		log.Fatalf("aggregate stream error: %v", err)
 	}
+
+	// Ako je korisnik eksplicitno zadao -month/-year, prikaži window (UTC)
 	if flagMonth != 0 && flagYear != 0 {
 		winStart, winEnd := util.MonthWindowUTC(useYear, useMonth)
-		winEnd = winEnd.Add(-time.Second) // vizuelno inkluzivno
+		winEnd = winEnd.Add(-time.Second) // vizuelno inkluzivan kraj
 		log.Printf("[INFO] meta_mode=filtered min=%s max=%s rows=%d",
 			winStart.Format("2006-01-02 15:04:05"),
 			winEnd.Format("2006-01-02 15:04:05"),
 			agg.FilteredRows,
 		)
-	} else {
-		log.Printf("[INFO] month=%d year=%d rows=%d start=%s end=%s",
-			useMonth, useYear, stats.Rows,
-			stats.Min.Format("2006-01-02 15:04:05"),
-			stats.Max.Format("2006-01-02 15:04:05"),
-		)
 	}
-
-	// Operativni debug iz DebugInfo
+	// Operativni debug
 	log.Printf("[DEBUG] read=%d skip_month=%d parse_err=%d no_method=%d no_status=%d header=%v",
 		dbg.TotalRead, dbg.SkipWrongMonth, dbg.SkipParseErr, dbg.SkipNoMethod, dbg.SkipNoStatus, dbg.LastHeader)
 
-	// 3) Meta za update projekta: koristimo filtrirani prozor ako su mesec/godina eksplicitni i postoje podaci
+	// Uvek prikaži i globalni CSV raspon za referencu
+	log.Printf("[INFO] month=%d year=%d rows=%d start=%s end=%s",
+		useMonth, useYear, stats.Rows,
+		stats.Min.Format("2006-01-02 15:04:05"),
+		stats.Max.Format("2006-01-02 15:04:05"),
+	)
+
+	// 3) Meta za update projekta: ako je zadat -month/-year, koristimo FILTERED (UTC prozor)
 	var metaMin, metaMax time.Time
 	var metaRows int64
 	if flagMonth != 0 && flagYear != 0 && agg.FilteredRows > 0 && !agg.MinTS.IsZero() && !agg.MaxTS.IsZero() {
@@ -177,18 +176,10 @@ func main() {
 		log.Printf("[INFO] meta_mode=auto (using full CSV stats)")
 	}
 
-	// 4) Update project meta (SAFE)
-	{
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		err = project.UpdateProjectMetaSafe(ctx, conn, flagProjectID, metaMin, metaMax, metaRows, flagAllowOverwrite)
-		cancel()
-		if err != nil {
-			log.Fatalf("update project meta error: %v", err)
-		}
-		log.Printf("[OK] logana_project updated (id=%d)", flagProjectID)
-	}
+	// broj kolona iz headera
+	noCols := len(dbg.LastHeader)
 
-	// 5) Ako je dry-run -> samo izveštaj i izlaz
+	// 4) Ako je -dry-run, ne diramo bazu – samo izveštaj i izlaz
 	if flagDryRun {
 		log.Printf("[DRY] filtered_rows=%d methods=%d respCodes=%d sitemap=%d aiBots=%d",
 			agg.FilteredRows, len(agg.MethodCounts), len(agg.StatusCounts), agg.SitemapCount, len(agg.AIBotCounts),
@@ -197,10 +188,15 @@ func main() {
 		return
 	}
 
-	// 6) Ako ne želimo stats inserte u ovom run-u, završavamo posle meta
-	if !flagWriteStats {
-		log.Printf("[SKIP] stats inserts disabled (run with -write-stats to insert into general/sitemap/aibots).")
-		log.Printf("[DONE] Meta-only run finished.")
+	// 5) U ovom koraku možda želimo SAMO projekat (bez drugih tabela)
+	if flagOnlyProj {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err = project.UpdateProjectMeta(ctx, conn, flagProjectID, metaMin, metaMax, metaRows, noCols)
+		cancel()
+		if err != nil {
+			log.Fatalf("update project meta error: %v", err)
+		}
+		log.Printf("[OK] logana_project updated (id=%d, no_cols=%d)", flagProjectID, noCols)
 		return
 	}
 
@@ -215,7 +211,7 @@ func main() {
 		}
 	}
 
-	// 7a) general INSERTs
+	// 6a) general INSERTs
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
@@ -233,7 +229,7 @@ func main() {
 		log.Printf("[OK] general inserts done")
 	}
 
-	// 7b) sitemap INSERTs
+	// 6b) sitemap INSERTs
 	{
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -249,7 +245,7 @@ func main() {
 		log.Printf("[OK] sitemap inserts done")
 	}
 
-	// 7c) AI bot INSERTs (ako tabela postoji)
+	// 6c) AI bot INSERTs (ako tabela postoji)
 	{
 		if !hasAIBots {
 			log.Printf("[SKIP] ln_aiBotHitsByName not present — skipping aibot inserts")
@@ -270,16 +266,6 @@ func main() {
 		}
 	}
 
-	// 8) Finalizacija projekta (is_active=0) — radimo tek posle svih inserta
-	{
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		err = project.MarkInactive(ctx, conn, flagProjectID)
-		cancel()
-		if err != nil {
-			log.Fatalf("mark inactive error: %v", err)
-		}
-		log.Printf("[OK] project %d marked inactive", flagProjectID)
-	}
-
-	log.Printf("[DONE] Sprint 2 finished at %s", time.Now().Format(time.RFC3339))
+	// Ne diramo is_active ovde – ostaje 0, po dogovoru.
+	log.Printf("[DONE] Ingest finished at %s", time.Now().Format(time.RFC3339))
 }
