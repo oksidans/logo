@@ -14,8 +14,8 @@ import (
 
 type Result struct {
 	IP       string
-	BotName  string // "DetectedBot|" ili "basedomain.tld" ili "unable to verify bot"
-	Verified bool   // true samo ako je poznati bot detektovan (preko botdetector)
+	BotName  string // bazni PTR domen (ako PTR postoji), inače labela; bez '|'
+	Verified bool   // true ako je botdetector prepoznao poznatog bota (po PTR-u)
 }
 
 // VerifyIPs – parallel reverse DNS lookup with progress channel.
@@ -35,7 +35,7 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 				ptrs, _ := net.DefaultResolver.LookupAddr(rCtx, ip)
 				cancel()
 
-				botNameCanonical, verified := combineBotNameAndPtrs(ptrs)
+				botNameCanonical, verified := canonicalFromPTRs(ptrs)
 				if botNameCanonical == "" {
 					botNameCanonical = "unable to verify bot"
 				}
@@ -72,31 +72,12 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 	return results, nil
 }
 
-// baseDomain: vrati eTLD+1 (heuristika, dovoljno za naše potrebe)
-func baseDomain(host string) string {
-	h := strings.ToLower(strings.TrimSpace(host))
-	h = strings.TrimSuffix(h, ".")
-	if h == "" {
-		return h
-	}
-	parts := strings.Split(h, ".")
-	if len(parts) < 2 {
-		return h
-	}
-	last := parts[len(parts)-1]
-	second := parts[len(parts)-2]
-	// podrška za *.co.uk, *.ac.uk, ...
-	if last == "uk" && (second == "co" || second == "ac" || second == "gov" || second == "ltd" || second == "plc" || second == "org") && len(parts) >= 3 {
-		return parts[len(parts)-3] + "." + second + "." + last
-	}
-	return second + "." + last
-}
+// ---- helpers ----
 
-// stripNumericPrefix: odbaci vodeće labele koje sadrže bar jednu cifru
-// npr. "66-249-66-1.googlebot.com" -> "googlebot.com"
-//
-//	"crawl-66-249-75-166.googlebot.com" -> "googlebot.com"
-//	"ec2-47-128-...ap-southeast-1.compute.amazonaws.com" -> "ap-southeast-1.compute.amazonaws.com"
+// stripNumericPrefix: odbaci vodeće labele koje sadrže cifru.
+// "66-249-66-1.googlebot.com"         -> "googlebot.com"
+// "crawl-66-249-75-166.googlebot.com" -> "googlebot.com"
+// "ec2-47-...ap-southeast-1.compute.amazonaws.com" -> "ap-southeast-1.compute.amazonaws.com"
 func stripNumericPrefix(host string) string {
 	h := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
 	if h == "" {
@@ -109,22 +90,37 @@ func stripNumericPrefix(host string) string {
 			i++
 			continue
 		}
-		// dozvoli i prefikse koji su “alfa+brojevi”, ali ako imaju broj – tretiramo ih kao numeričke
-		// (gore već pokriveno: “ima cifru”)
 		break
 	}
 	if i >= len(labels) {
-		// sve su numeričke — vrati original (bolje nego prazan)
 		return h
 	}
 	return strings.Join(labels[i:], ".")
 }
 
-// combineBotNameAndPtrs sa novom logikom:
-// - ako je poznat bot: "DetectedBot|"
-// - inače: uzmi prvi PTR, ukloni numeričke prefikse, pa eTLD+1 (npr. googlebot.com)
-// - ako nema PTR: ""
-func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
+// baseDomain: vrati eTLD+1; podrška za tipične dvoslojne sufikse (.co.uk …).
+func baseDomain(host string) string {
+	h := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+	if h == "" {
+		return h
+	}
+	parts := strings.Split(h, ".")
+	if len(parts) < 2 {
+		return h
+	}
+	last := parts[len(parts)-1]
+	second := parts[len(parts)-2]
+	if last == "uk" && (second == "co" || second == "ac" || second == "gov" || second == "ltd" || second == "plc" || second == "org") && len(parts) >= 3 {
+		return parts[len(parts)-3] + "." + second + "." + last
+	}
+	return second + "." + last
+}
+
+// canonicalFromPTRs:
+// - Ako postoji bar jedan PTR: uzmi prvi PTR, skini numeričke prefikse, pa svedi na eTLD+1 (npr. "googlebot.com").
+// - Verified je true ako je bilo koji PTR match-ovan u botdetectoru (labelu NE vraćamo u botName).
+// - Ako nema PTR-ova: "", false (caller će upisati "unable to verify bot").
+func canonicalFromPTRs(ptrs []string) (string, bool) {
 	clean := make([]string, 0, len(ptrs))
 	seen := make(map[string]struct{}, len(ptrs))
 	for _, p := range ptrs {
@@ -138,26 +134,21 @@ func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 		seen[p] = struct{}{}
 		clean = append(clean, p)
 	}
+	if len(clean) == 0 {
+		return "", false
+	}
 
-	// pokušaj detekcije poznatog bota
-	detected := ""
+	// verified = true ako je neki PTR poznat
+	verified := false
 	for _, p := range clean {
-		if name, ok := botdetector.Match(p); ok {
-			detected = name
+		if _, ok := botdetector.Match(p); ok {
+			verified = true
 			break
 		}
 	}
 
-	if detected != "" {
-		return detected + "|", true
-	}
-
-	if len(clean) > 0 {
-		trimmed := stripNumericPrefix(clean[0])
-		return baseDomain(trimmed), false
-	}
-
-	return "", false
+	trimmed := stripNumericPrefix(clean[0])
+	return baseDomain(trimmed), verified
 }
 
 // WriteResultsCSV writes verification results to CSV (verified as "1" or "0").
