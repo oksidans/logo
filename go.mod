@@ -4,7 +4,7 @@ go 1.23.4
 
 require (
 	github.com/bytedance/sonic v1.14.1
-	github.com/go-sql-driver/mysql v1.8.1
+	github.com/go-sql-driver/mysql v1.9.3
 	github.com/joho/godotenv v1.5.1
 	gopkg.in/yaml.v3 v3.0.1
 )
