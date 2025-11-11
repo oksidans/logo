@@ -148,7 +148,7 @@ func MapToCSV(src map[string]string) []string {
 		if strings.Contains(lcUA, b) {
 			switch b {
 			case "googlebot":
-				botName = "Googlebot"
+				botName = "googlebot.com"
 			case "bingbot":
 				botName = "Bingbot"
 			case "duckduckbot":

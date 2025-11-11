@@ -14,12 +14,11 @@ import (
 
 type Result struct {
 	IP       string
-	BotName  string // DetektovaniBot|PTR1|PTR2|... ili samo PTR-ovi, ili "unable to verify bot"
+	BotName  string // "DetectedBot|" ili "basedomain.tld" ili "unable to verify bot"
 	Verified bool   // true samo ako je poznati bot detektovan (preko botdetector)
 }
 
 // VerifyIPs – parallel reverse DNS lookup with progress channel.
-// progress prima +1 po obradi svake IP adrese (može biti nil).
 func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Duration, progress chan<- int) ([]Result, error) {
 	jobs := make(chan string, workers*2)
 	resultsChan := make(chan Result, workers*2)
@@ -36,13 +35,13 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 				ptrs, _ := net.DefaultResolver.LookupAddr(rCtx, ip)
 				cancel()
 
-				botNameCombined, verified := combineBotNameAndPtrs(ptrs)
-				if botNameCombined == "" {
-					botNameCombined = "unable to verify bot"
+				botNameCanonical, verified := combineBotNameAndPtrs(ptrs)
+				if botNameCanonical == "" {
+					botNameCanonical = "unable to verify bot"
 				}
 				resultsChan <- Result{
 					IP:       ip,
-					BotName:  botNameCombined,
+					BotName:  botNameCanonical,
 					Verified: verified,
 				}
 				if progress != nil {
@@ -73,16 +72,63 @@ func VerifyIPs(ctx context.Context, ips []string, workers int, timeout time.Dura
 	return results, nil
 }
 
-// combineBotNameAndPtrs vrati:
-// - "<DetectedBot>|<PTR1>|<PTR2>|..." ako je poznati bot nađen,
-// - "<PTR1>|<PTR2>|..." ako nije,
-// - "" ako nema PTR-ova uopšte.
+// baseDomain: vrati eTLD+1 (heuristika, dovoljno za naše potrebe)
+func baseDomain(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	h = strings.TrimSuffix(h, ".")
+	if h == "" {
+		return h
+	}
+	parts := strings.Split(h, ".")
+	if len(parts) < 2 {
+		return h
+	}
+	last := parts[len(parts)-1]
+	second := parts[len(parts)-2]
+	// podrška za *.co.uk, *.ac.uk, ...
+	if last == "uk" && (second == "co" || second == "ac" || second == "gov" || second == "ltd" || second == "plc" || second == "org") && len(parts) >= 3 {
+		return parts[len(parts)-3] + "." + second + "." + last
+	}
+	return second + "." + last
+}
+
+// stripNumericPrefix: odbaci vodeće labele koje sadrže bar jednu cifru
+// npr. "66-249-66-1.googlebot.com" -> "googlebot.com"
+//
+//	"crawl-66-249-75-166.googlebot.com" -> "googlebot.com"
+//	"ec2-47-128-...ap-southeast-1.compute.amazonaws.com" -> "ap-southeast-1.compute.amazonaws.com"
+func stripNumericPrefix(host string) string {
+	h := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+	if h == "" {
+		return h
+	}
+	labels := strings.Split(h, ".")
+	i := 0
+	for i < len(labels) {
+		if strings.IndexFunc(labels[i], func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			i++
+			continue
+		}
+		// dozvoli i prefikse koji su “alfa+brojevi”, ali ako imaju broj – tretiramo ih kao numeričke
+		// (gore već pokriveno: “ima cifru”)
+		break
+	}
+	if i >= len(labels) {
+		// sve su numeričke — vrati original (bolje nego prazan)
+		return h
+	}
+	return strings.Join(labels[i:], ".")
+}
+
+// combineBotNameAndPtrs sa novom logikom:
+// - ako je poznat bot: "DetectedBot|"
+// - inače: uzmi prvi PTR, ukloni numeričke prefikse, pa eTLD+1 (npr. googlebot.com)
+// - ako nema PTR: ""
 func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 	clean := make([]string, 0, len(ptrs))
 	seen := make(map[string]struct{}, len(ptrs))
 	for _, p := range ptrs {
-		p = strings.TrimSpace(p)
-		p = strings.TrimSuffix(p, ".")
+		p = strings.TrimSpace(strings.TrimSuffix(p, "."))
 		if p == "" {
 			continue
 		}
@@ -93,6 +139,7 @@ func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 		clean = append(clean, p)
 	}
 
+	// pokušaj detekcije poznatog bota
 	detected := ""
 	for _, p := range clean {
 		if name, ok := botdetector.Match(p); ok {
@@ -101,16 +148,16 @@ func combineBotNameAndPtrs(ptrs []string) (combined string, verified bool) {
 		}
 	}
 
-	switch {
-	case detected != "" && len(clean) > 0:
-		return detected + "|" + strings.Join(clean, "|"), true
-	case detected != "" && len(clean) == 0:
-		return detected, true
-	case detected == "" && len(clean) > 0:
-		return strings.Join(clean, "|"), false
-	default:
-		return "", false
+	if detected != "" {
+		return detected + "|", true
 	}
+
+	if len(clean) > 0 {
+		trimmed := stripNumericPrefix(clean[0])
+		return baseDomain(trimmed), false
+	}
+
+	return "", false
 }
 
 // WriteResultsCSV writes verification results to CSV (verified as "1" or "0").
@@ -119,7 +166,7 @@ func WriteResultsCSV(outPath string, results []Result) error {
 	if err != nil {
 		return err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	w := csv.NewWriter(f)
 	defer w.Flush()
