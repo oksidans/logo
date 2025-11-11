@@ -36,7 +36,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer dbh.Close()
+	defer func() {
+		if cerr := dbh.Close(); cerr != nil {
+			log.Printf("[WARN] db close failed: %v", cerr)
+		}
+	}()
 
 	p := gen.Params{CSV: *csv, ProjectID: *pid, Month: *month, Year: *year}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Hour)

@@ -22,7 +22,7 @@ type Params struct {
 func inc(m map[string]int64, k string) { m[k]++ }
 func norm(s string) string             { return strings.TrimSpace(s) }
 
-// roundN zaokružuje na n decimala (bankers-not needed; dovoljno HalfUp)
+// roundN zaokružuje na n decimala
 func roundN(x float64, n int) float64 {
 	p := math.Pow(10, float64(n))
 	return math.Round(x*p) / p
@@ -45,7 +45,7 @@ func readCSV(path string) (func() ([]string, error), map[string]int, func() erro
 
 	header, err := r.Read()
 	if err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, nil, nil, err
 	}
 
@@ -76,6 +76,53 @@ func getField(rec []string, hmap map[string]int, want string) string {
 	return strings.TrimSpace(rec[idx])
 }
 
+// === helperi za kanonizaciju botName ===
+
+// baseDomain vraća eTLD+1 za tipične slučajeve (heuristika, po potrebi proširi listu)
+func baseDomain(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	h = strings.TrimSuffix(h, ".")
+	if h == "" {
+		return h
+	}
+	parts := strings.Split(h, ".")
+	if len(parts) < 2 {
+		return h
+	}
+	last := parts[len(parts)-1]
+	second := parts[len(parts)-2]
+	if last == "uk" && (second == "co" || second == "ac" || second == "gov" || second == "ltd" || second == "plc" || second == "org") && len(parts) >= 3 {
+		return parts[len(parts)-3] + "." + second + "." + last
+	}
+	return second + "." + last
+}
+
+// canonicalBot proizvodi željeni oblik:
+// - ako postoji label pre '|', vrati "Label|" (npr. "Googlebot|")
+// - inače vrati bazni PTR domen (npr. "googlebot.com")
+func canonicalBot(raw string) string {
+	s := strings.TrimSpace(raw)
+	var label, ptr string
+	if i := strings.IndexByte(s, '|'); i >= 0 {
+		label = strings.TrimSpace(s[:i])
+		ptr = strings.TrimSpace(s[i+1:])
+	} else {
+		label = s
+	}
+
+	if label != "" {
+		label = strings.Trim(label, "[]()")
+		if sp := strings.IndexByte(label, ' '); sp >= 0 {
+			label = strings.TrimSpace(label[:sp])
+		}
+		return label + "|"
+	}
+	if ptr != "" {
+		return baseDomain(ptr)
+	}
+	return s
+}
+
 // ==============================
 // ln_genBotsMainStats — value_counts(botName), proporcija i isNumeric
 // ==============================
@@ -84,7 +131,11 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 	if err != nil {
 		return err
 	}
-	defer closef()
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
 
 	if _, ok := hmap["botname"]; !ok {
 		log.Printf("[WARN] CSV nema kolonu 'botName' (header=%v)", hmap)
@@ -94,14 +145,18 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 	var total int64
 
 	for {
-		rec, err := next()
-		if err == io.EOF {
+		rec, rerr := next()
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return rerr
 		}
-		bot := norm(getField(rec, hmap, "botName"))
+		raw := norm(getField(rec, hmap, "botName"))
+		if raw == "" {
+			continue
+		}
+		bot := canonicalBot(raw)
 		if bot == "" {
 			continue
 		}
@@ -113,60 +168,68 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 		log.Printf("[WARN] InsertMain: total=0 – nema redova za agregaciju")
 	}
 
-	// “sumnjivi” botovi: ime sadrži cifre
 	numericPattern := regexp.MustCompile(`[0-9]`)
 
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	// linter-safe rollback
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
 	stmt, err := tx.PrepareContext(ctx, insMain)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
-	defer stmt.Close()
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
 
 	for bot, c := range counts {
 		isNumeric := 0
 		if numericPattern.MatchString(bot) {
 			isNumeric = 1
 		}
-
-		// proporcija po Python logici: udeo ovog bota u ukupnom uzorku
-		// tabela ima DECIMAL(6,2) -> zaokruži na 2 decimale (u procentima ili frakciji?)
-		// Uobičajeno: procenat. Ako želiš frakciju 0..1, zameni 100.0 sa 1.0 i zaokruži na 4+ dec.
+		// % u dva decimala
 		prop := 0.0
 		if total > 0 {
-			prop = roundN((float64(c)*100.0)/float64(total), 2) // npr. 12.34 (%)
+			prop = roundN((float64(c)*100.0)/float64(total), 2)
 		}
 
 		if _, err := stmt.ExecContext(ctx,
-			bot,  // botName
-			c,    // botStats
-			prop, // botStatsProp (procenat)
-			isNumeric,
-			p.Month,
-			p.Year,
-			p.ProjectID,
+			bot, c, prop, isNumeric,
+			p.Month, p.Year, p.ProjectID,
 		); err != nil {
-			tx.Rollback()
 			return err
 		}
 	}
-	return tx.Commit()
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 // ==============================
 // Ostale “By*” tabele – (source, value, valueProp, month, year, project_id)
-// valueProp = udeo te kategorije u ukupnom broju redova
+// valueProp = % u tri decimale
 // ==============================
 func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL string) error {
 	next, hmap, closef, err := readCSV(p.CSV)
 	if err != nil {
 		return err
 	}
-	defer closef()
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
 
 	if _, ok := hmap[strings.ToLower(col)]; !ok {
 		log.Printf("[WARN] CSV nema kolonu %q (header=%v)", col, hmap)
@@ -176,12 +239,12 @@ func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL strin
 	var total int64
 
 	for {
-		rec, err := next()
-		if err == io.EOF {
+		rec, rerr := next()
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return err
+		if rerr != nil {
+			return rerr
 		}
 		v := norm(getField(rec, hmap, col))
 		if v == "" {
@@ -199,32 +262,39 @@ func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL strin
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
 	stmt, err := tx.PrepareContext(ctx, insertSQL)
 	if err != nil {
-		tx.Rollback()
 		return err
 	}
-	defer stmt.Close()
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
 
-	// DECIMAL(6,3) u By* tabelama -> zaokružimo na 3 decimale (procenat)
 	for source, c := range counts {
 		prop := 0.0
 		if total > 0 {
 			prop = roundN((float64(c)*100.0)/float64(total), 3)
 		}
 		if _, err := stmt.ExecContext(ctx,
-			source, // source
-			c,      // value
-			prop,   // valueProp (%)
-			p.Month,
-			p.Year,
-			p.ProjectID,
+			source, c, prop,
+			p.Month, p.Year, p.ProjectID,
 		); err != nil {
-			tx.Rollback()
 			return err
 		}
 	}
-	return tx.Commit()
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func InsertBySource(ctx context.Context, db *sql.DB, p Params) error {
