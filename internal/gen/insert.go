@@ -9,7 +9,9 @@ import (
 	"math"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
+	"unicode"
 )
 
 type Params struct {
@@ -78,10 +80,38 @@ func getField(rec []string, hmap map[string]int, want string) string {
 
 // === helperi za kanonizaciju botName ===
 
-// baseDomain vraća eTLD+1 za tipične slučajeve (heuristika, po potrebi proširi listu)
+// stripNumericPrefix: odbaci vodeće labele koje sadrže cifru
+// npr. "66-249-66-1.googlebot.com" -> "googlebot.com"
+func stripNumericPrefix(host string) string {
+	h := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
+	if h == "" {
+		return h
+	}
+	labels := strings.Split(h, ".")
+	i := 0
+	for i < len(labels) {
+		hasDigit := false
+		for _, r := range labels[i] {
+			if unicode.IsDigit(r) {
+				hasDigit = true
+				break
+			}
+		}
+		if hasDigit {
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(labels) {
+		return h
+	}
+	return strings.Join(labels[i:], ".")
+}
+
+// baseDomain vraća eTLD+1 za tipične slučajeve (heuristika, uključuje .co.uk varijantu)
 func baseDomain(host string) string {
-	h := strings.ToLower(strings.TrimSpace(host))
-	h = strings.TrimSuffix(h, ".")
+	h := strings.ToLower(strings.TrimSpace(strings.TrimSuffix(host, ".")))
 	if h == "" {
 		return h
 	}
@@ -91,6 +121,7 @@ func baseDomain(host string) string {
 	}
 	last := parts[len(parts)-1]
 	second := parts[len(parts)-2]
+	// gruba podrška za UK višeslojne TLD-ove
 	if last == "uk" && (second == "co" || second == "ac" || second == "gov" || second == "ltd" || second == "plc" || second == "org") && len(parts) >= 3 {
 		return parts[len(parts)-3] + "." + second + "." + last
 	}
@@ -98,27 +129,18 @@ func baseDomain(host string) string {
 }
 
 // canonicalBot proizvodi željeni oblik:
-// - ako postoji label pre '|', vrati "Label|" (npr. "Googlebot|")
-// - inače vrati bazni PTR domen (npr. "googlebot.com")
+// - ako je format "Label|PTR", vrati bazni domen iz PTR-a (npr. "googlebot.com")
+// - ako nema PTR-a, vrati sirovu vrednost (labelu)
+// - ako je već domen, ostavi ga
 func canonicalBot(raw string) string {
 	s := strings.TrimSpace(raw)
-	var label, ptr string
-	if i := strings.IndexByte(s, '|'); i >= 0 {
-		label = strings.TrimSpace(s[:i])
-		ptr = strings.TrimSpace(s[i+1:])
-	} else {
-		label = s
+	if s == "" {
+		return s
 	}
-
-	if label != "" {
-		label = strings.Trim(label, "[]()")
-		if sp := strings.IndexByte(label, ' '); sp >= 0 {
-			label = strings.TrimSpace(label[:sp])
-		}
-		return label + "|"
-	}
-	if ptr != "" {
-		return baseDomain(ptr)
+	if strings.Contains(s, "|") {
+		parts := strings.Split(s, "|")
+		last := strings.TrimSpace(parts[len(parts)-1]) // očekujemo PTR na kraju
+		return baseDomain(stripNumericPrefix(last))
 	}
 	return s
 }
@@ -157,7 +179,7 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 			continue
 		}
 		bot := canonicalBot(raw)
-		if bot == "" {
+		if bot == "" || bot == "unable to verify bot" {
 			continue
 		}
 		inc(counts, bot)
@@ -167,6 +189,22 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 	if total == 0 {
 		log.Printf("[WARN] InsertMain: total=0 – nema redova za agregaciju")
 	}
+
+	// value_counts poredak: Count DESC, Name ASC
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for name, c := range counts {
+		pairs = append(pairs, kv{name, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
 
 	numericPattern := regexp.MustCompile(`[0-9]`)
 
@@ -191,19 +229,19 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 		}
 	}()
 
-	for bot, c := range counts {
+	for _, pkv := range pairs {
 		isNumeric := 0
-		if numericPattern.MatchString(bot) {
+		if numericPattern.MatchString(pkv.Name) {
 			isNumeric = 1
 		}
 		// % u dva decimala
 		prop := 0.0
 		if total > 0 {
-			prop = roundN((float64(c)*100.0)/float64(total), 2)
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 2)
 		}
 
 		if _, err := stmt.ExecContext(ctx,
-			bot, c, prop, isNumeric,
+			pkv.Name, pkv.Count, prop, isNumeric,
 			p.Month, p.Year, p.ProjectID,
 		); err != nil {
 			return err
@@ -258,6 +296,22 @@ func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL strin
 		log.Printf("[WARN] insertByCol(%s): total=0 – nema redova za agregaciju", col)
 	}
 
+	// value_counts poredak i ovde (stabilnost između env-ova)
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for n, c := range counts {
+		pairs = append(pairs, kv{n, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -278,13 +332,13 @@ func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL strin
 		}
 	}()
 
-	for source, c := range counts {
+	for _, pkv := range pairs {
 		prop := 0.0
 		if total > 0 {
-			prop = roundN((float64(c)*100.0)/float64(total), 3)
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 3)
 		}
 		if _, err := stmt.ExecContext(ctx,
-			source, c, prop,
+			pkv.Name, pkv.Count, prop,
 			p.Month, p.Year, p.ProjectID,
 		); err != nil {
 			return err
