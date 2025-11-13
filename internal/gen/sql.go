@@ -20,7 +20,7 @@ ON DUPLICATE KEY UPDATE
 
 	insByMethod = `
 INSERT INTO ln_genBotsMainStatsByMethod
-(source, value, valueProp, month, year, project_id)
+(method, value, valueProp, month, year, project_id)
 VALUES (?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
   value = VALUES(value),
@@ -28,23 +28,38 @@ ON DUPLICATE KEY UPDATE
 
 	insByVerification = `
 INSERT INTO ln_genBotsMainStatsByVerification
-(source, value, valueProp, month, year, project_id)
-VALUES (?, ?, ?, ?, ?, ?)
+(verified, unverified, month, year, project_id)
+VALUES (?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
-  value = VALUES(value),
-  valueProp = VALUES(valueProp)`
+  verified = VALUES(verified),
+  unverified = VALUES(unverified)
+`
 
 	insByRefPage = `
 INSERT INTO ln_genBotsMainStatsByRefPage
-(source, value, valueProp, month, year, project_id)
+(url, value, valueProp, month, year, project_id)
 VALUES (?, ?, ?, ?, ?, ?)
-ON DUPLICATE KEY UPDATE
-  value = VALUES(value),
-  valueProp = VALUES(valueProp)`
+`
 
 	insByTarget = `
 INSERT INTO ln_genBotsMainStatsByTarget
-(source, value, valueProp, month, year, project_id)
+(target, value, valueProp, month, year, project_id)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  value     = VALUES(value),
+  valueProp = VALUES(valueProp)`
+
+	insByProtVersion = `
+INSERT INTO ln_genBotsMainStatsByProtVersion
+(protocol, value, valueProp, month, year, project_id)
+VALUES (?, ?, ?, ?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  value     = VALUES(value),
+  valueProp = VALUES(valueProp)`
+
+	insBySitemap = `
+INSERT INTO ln_genBotsMainStatsBySitemap
+(url, value, valueProp, month, year, project_id)
 VALUES (?, ?, ?, ?, ?, ?)
 ON DUPLICATE KEY UPDATE
   value = VALUES(value),
