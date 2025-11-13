@@ -18,13 +18,15 @@ func main() {
 		year  = flag.Int("year", 0, "Year (e.g. 2025)")
 		pid   = flag.Int64("project-id", 0, "Project ID")
 
-		all   = flag.Bool("all", true, "Run all gen inserts")
-		mainF = flag.Bool("main", false, "Only ln_genBotsMainStats")
-		srcF  = flag.Bool("by-source", false, "ln_genBotsMainStatsBySource")
-		mtdF  = flag.Bool("by-method", false, "ln_genBotsMainStatsByMethod")
-		verF  = flag.Bool("by-verification", false, "ln_genBotsMainStatsByVerification")
-		refF  = flag.Bool("by-refpage", false, "ln_genBotsMainStatsByRefPage")
-		tgtF  = flag.Bool("by-target", false, "ln_genBotsMainStatsByTarget")
+		all               = flag.Bool("all", true, "Run all gen inserts")
+		mainF             = flag.Bool("main", false, "Only ln_genBotsMainStats")
+		srcF              = flag.Bool("by-source", false, "ln_genBotsMainStatsBySource")
+		mtdF              = flag.Bool("by-method", false, "ln_genBotsMainStatsByMethod")
+		verF              = flag.Bool("by-verification", false, "ln_genBotsMainStatsByVerification")
+		refF              = flag.Bool("by-refpage", false, "ln_genBotsMainStatsByRefPage")
+		tgtF              = flag.Bool("by-target", false, "ln_genBotsMainStatsByTarget")
+		flagByProtVersion = flag.Bool("by-protversion", false, "ln_genBotsMainStatsByProtVersion")
+		bySitemap         = flag.Bool("by-sitemap", false, "ln_genBotsMainStatsBySitemap")
 	)
 	flag.Parse()
 
@@ -71,6 +73,12 @@ func main() {
 	}
 	if *all || *tgtF {
 		run("ln_genBotsMainStatsByTarget", gen.InsertByTarget)
+	}
+	if *all || *flagByProtVersion {
+		run("ln_genBotsMainStatsByProtVersion", gen.InsertByProtVersion)
+	}
+	if *all || *bySitemap {
+		run("ln_genBotsMainStatsBySitemap", gen.InsertBySitemap)
 	}
 
 	log.Printf("✅ geninsert complete")

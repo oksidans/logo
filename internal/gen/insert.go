@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -23,6 +24,15 @@ type Params struct {
 
 func inc(m map[string]int64, k string) { m[k]++ }
 func norm(s string) string             { return strings.TrimSpace(s) }
+
+// truncateRunes skraćuje string na najviše max runa (karaktera).
+func truncateRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
+}
 
 // roundN zaokružuje na n decimala
 func roundN(x float64, n int) float64 {
@@ -255,8 +265,8 @@ func InsertMain(ctx context.Context, db *sql.DB, p Params) error {
 }
 
 // ==============================
-// Ostale “By*” tabele – (source, value, valueProp, month, year, project_id)
-// valueProp = % u tri decimale
+// Ostale “By*” tabele – generički slučaj
+// (kolona, value, valueProp(6,3), month, year, project_id)
 // ==============================
 func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL string) error {
 	next, hmap, closef, err := readCSV(p.CSV)
@@ -354,15 +364,538 @@ func insertByCol(ctx context.Context, db *sql.DB, p Params, col, insertSQL strin
 func InsertBySource(ctx context.Context, db *sql.DB, p Params) error {
 	return insertByCol(ctx, db, p, "source", insBySource)
 }
+
 func InsertByMethod(ctx context.Context, db *sql.DB, p Params) error {
 	return insertByCol(ctx, db, p, "method", insByMethod)
 }
+
+// ===== Specijalni slučaj: ln_genBotsMainStatsByVerification =====
+// Šema: (id, verified, unverified, month, year, project_id)
+// -> upisujemo JEDAN red sa sumama verified/unverified
 func InsertByVerification(ctx context.Context, db *sql.DB, p Params) error {
-	return insertByCol(ctx, db, p, "verified", insByVerification)
+	// Otvori CSV i mapiraj header
+	f, err := os.Open(p.CSV)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
+
+	r := csv.NewReader(f)
+	r.FieldsPerRecord = -1
+
+	header, err := r.Read()
+	if err != nil {
+		return err
+	}
+	hmap := make(map[string]int, len(header))
+	for i, h := range header {
+		key := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(h, "\ufeff")))
+		hmap[key] = i
+	}
+	idx, ok := hmap["verified"]
+	if !ok {
+		log.Printf("[WARN] CSV nema kolonu 'verified' (header=%v)", header)
+	}
+
+	var ver, unv int64
+	readField := func(rec []string, idx int) string {
+		if idx < 0 || idx >= len(rec) {
+			return ""
+		}
+		return strings.TrimSpace(rec[idx])
+	}
+
+	for {
+		rec, rerr := r.Read()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+		val := ""
+		if ok {
+			val = readField(rec, idx)
+		}
+
+		l := strings.ToLower(val)
+		isTrue := l == "1" || l == "true" || l == "yes" || l == "y"
+		if !isTrue {
+			if n, err := strconv.Atoi(l); err == nil {
+				isTrue = (n != 0)
+			}
+		}
+		if isTrue {
+			ver++
+		} else {
+			unv++
+		}
+	}
+
+	// Brisanje postojećih redova da izbegnemo duplikate
+	if _, err := db.ExecContext(ctx, `
+		DELETE FROM ln_genBotsMainStatsByVerification
+		WHERE project_id = ? AND month = ? AND year = ?`,
+		p.ProjectID, p.Month, p.Year,
+	); err != nil {
+		return err
+	}
+
+	// Upis jednog reda: (verified, unverified, month, year, project_id)
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, insByVerification)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
+
+	if _, err := stmt.ExecContext(ctx,
+		ver, unv, p.Month, p.Year, p.ProjectID,
+	); err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
+
+// ===== Specijalni slučaj: ln_genBotsMainStatsByRefPage =====
+// Šema: (id, url, value, valueProp(6,2), month, year, project_id)
+// CSV kolona: "referring_page" -> url
 func InsertByRefPage(ctx context.Context, db *sql.DB, p Params) error {
-	return insertByCol(ctx, db, p, "referring_page", insByRefPage)
+	const col = "referring_page"
+
+	next, hmap, closef, err := readCSV(p.CSV)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
+
+	if _, ok := hmap[strings.ToLower(col)]; !ok {
+		log.Printf("[WARN] CSV nema kolonu %q (header=%v)", col, hmap)
+	}
+
+	counts := make(map[string]int64)
+	var total int64
+
+	for {
+		rec, rerr := next()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+		v := norm(getField(rec, hmap, col))
+		if v == "" {
+			v = "(unknown)"
+		}
+		counts[v]++
+		total++
+	}
+
+	if total == 0 {
+		log.Printf("[WARN] InsertByRefPage: total=0 – nema redova za agregaciju")
+	}
+
+	// value_counts poredak: Count DESC, URL ASC
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for n, c := range counts {
+		pairs = append(pairs, kv{n, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, insByRefPage)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
+
+	for _, pkv := range pairs {
+		prop := 0.0
+		if total > 0 {
+			// decimal(6,2) => 2 decimale
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 2)
+		}
+
+		// ln_genBotsMainStatsByRefPage.url je VARCHAR(4050)
+		url := truncateRunes(pkv.Name, 4050)
+
+		if _, err := stmt.ExecContext(ctx,
+			url, pkv.Count, prop,
+			p.Month, p.Year, p.ProjectID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
+
+// ===== Specijalni slučaj: ln_genBotsMainStatsByTarget =====
+// Šema: (id, target, value, valueProp(6,2), month, year, project_id)
+// CSV kolona: "target"
 func InsertByTarget(ctx context.Context, db *sql.DB, p Params) error {
-	return insertByCol(ctx, db, p, "target", insByTarget)
+	const col = "target"
+
+	next, hmap, closef, err := readCSV(p.CSV)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
+
+	if _, ok := hmap[strings.ToLower(col)]; !ok {
+		log.Printf("[WARN] CSV nema kolonu %q (header=%v)", col, hmap)
+	}
+
+	counts := make(map[string]int64)
+	var total int64
+
+	for {
+		rec, rerr := next()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+		v := norm(getField(rec, hmap, col))
+		if v == "" {
+			v = "(unknown)"
+		}
+		counts[v]++
+		total++
+	}
+
+	if total == 0 {
+		log.Printf("[WARN] InsertByTarget: total=0 – nema redova za agregaciju")
+	}
+
+	// value_counts poredak: Count DESC, Name ASC
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for n, c := range counts {
+		pairs = append(pairs, kv{n, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, insByTarget)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
+
+	for _, pkv := range pairs {
+		prop := 0.0
+		if total > 0 {
+			// decimal(6,2) => 2 decimale
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 2)
+		}
+
+		// target je VARCHAR(45)
+		target := truncateRunes(pkv.Name, 45)
+
+		if _, err := stmt.ExecContext(ctx,
+			target, pkv.Count, prop,
+			p.Month, p.Year, p.ProjectID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ===== Specijalni slučaj: ln_genBotsMainStatsByProtVersion =====
+// Šema: (id, protocol, value, valueProp(6,3), month, year, project_id)
+// CSV kolona: "protocol"
+func InsertByProtVersion(ctx context.Context, db *sql.DB, p Params) error {
+	const col = "protocol"
+
+	next, hmap, closef, err := readCSV(p.CSV)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
+
+	if _, ok := hmap[strings.ToLower(col)]; !ok {
+		log.Printf("[WARN] CSV nema kolonu %q (header=%v)", col, hmap)
+	}
+
+	counts := make(map[string]int64)
+	var total int64
+
+	for {
+		rec, rerr := next()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+		v := norm(getField(rec, hmap, col))
+		if v == "" {
+			v = "(unknown)"
+		}
+		counts[v]++
+		total++
+	}
+
+	if total == 0 {
+		log.Printf("[WARN] InsertByProtVersion: total=0 – nema redova za agregaciju")
+	}
+
+	// value_counts poredak: Count DESC, Name ASC
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for n, c := range counts {
+		pairs = append(pairs, kv{n, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, insByProtVersion)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
+
+	for _, pkv := range pairs {
+		prop := 0.0
+		if total > 0 {
+			// decimal(6,3) => 3 decimale
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 3)
+		}
+
+		// protocol je VARCHAR(50)
+		protocol := truncateRunes(pkv.Name, 50)
+
+		if _, err := stmt.ExecContext(ctx,
+			protocol, pkv.Count, prop,
+			p.Month, p.Year, p.ProjectID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ===== Specijalni slučaj: ln_genBotsMainStatsBySitemap =====
+// Šema: (id, url, value, valueProp(6,2), month, year, project_id)
+// Logika: URL je iz kolone "referring_page",
+// ali uzimamo SAMO one redove gde URL ima "sitemap" ili se završava na ".xml".
+func InsertBySitemap(ctx context.Context, db *sql.DB, p Params) error {
+	const urlCol = "referring_page"
+
+	next, hmap, closef, err := readCSV(p.CSV)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := closef(); cerr != nil {
+			log.Printf("[WARN] close CSV failed: %v", cerr)
+		}
+	}()
+
+	if _, ok := hmap[strings.ToLower(urlCol)]; !ok {
+		log.Printf("[WARN] CSV nema kolonu %q (header=%v)", urlCol, hmap)
+	}
+
+	counts := make(map[string]int64)
+	var total int64
+
+	for {
+		rec, rerr := next()
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
+
+		url := norm(getField(rec, hmap, urlCol))
+		if url == "" {
+			continue
+		}
+		low := strings.ToLower(url)
+
+		// Uzimamo samo URL-ove koji liče na sitemap:
+		// sadrže "sitemap" ili se završavaju na ".xml"
+		if !strings.Contains(low, "sitemap") && !strings.HasSuffix(low, ".xml") {
+			continue
+		}
+
+		counts[url]++
+		total++
+	}
+
+	if total == 0 {
+		log.Printf("[WARN] InsertBySitemap: total=0 – nema redova za agregaciju")
+	}
+
+	// value_counts poredak: Count DESC, URL ASC
+	type kv struct {
+		Name  string
+		Count int64
+	}
+	pairs := make([]kv, 0, len(counts))
+	for n, c := range counts {
+		pairs = append(pairs, kv{n, c})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count == pairs[j].Count {
+			return pairs[i].Name < pairs[j].Name
+		}
+		return pairs[i].Count > pairs[j].Count
+	})
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := tx.Rollback(); rerr != nil && rerr != sql.ErrTxDone {
+			log.Printf("[WARN] tx.Rollback failed: %v", rerr)
+		}
+	}()
+
+	stmt, err := tx.PrepareContext(ctx, insBySitemap)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if serr := stmt.Close(); serr != nil {
+			log.Printf("[WARN] stmt.Close failed: %v", serr)
+		}
+	}()
+
+	for _, pkv := range pairs {
+		prop := 0.0
+		if total > 0 {
+			// decimal(6,2) => 2 decimale
+			prop = roundN((float64(pkv.Count)*100.0)/float64(total), 2)
+		}
+
+		// url je VARCHAR(4500)
+		url := truncateRunes(pkv.Name, 4500)
+
+		if _, err := stmt.ExecContext(ctx,
+			url, pkv.Count, prop,
+			p.Month, p.Year, p.ProjectID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return nil
 }
